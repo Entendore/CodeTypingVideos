@@ -2,6 +2,11 @@
 """
 Code Typing Video Generator
 Creates MP4 videos of code being typed with realistic animation and sound effects.
+
+Folder structure (auto-created in CWD):
+  input/   ← Drop .py .js .ts .txt etc. files here
+  output/  ← Exported MP4s land here automatically
+  tmp/     ← Temp files (sounds, intermediate video), cleaned on exit
 """
 
 import sys
@@ -14,7 +19,7 @@ import re
 import shutil
 import time as _time
 import threading
-import logging                 # [NEW] Added logging
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -37,12 +42,34 @@ from PySide6.QtMultimedia import QSoundEffect
 
 import cv2
 
-# [NEW] Configure logging to terminal
+# ── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-25s | %(message)s',
     datefmt='%H:%M:%S'
 )
+
+# ── CWD-based directories ──────────────────────────────────────────
+CWD = os.getcwd()
+INPUT_DIR = os.path.join(CWD, "input")
+OUTPUT_DIR = os.path.join(CWD, "output")
+TMP_DIR = os.path.join(CWD, "tmp")
+
+SUPPORTED_EXTENSIONS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.h',
+    '.hpp', '.cs', '.go', '.rs', '.rb', '.php', '.swift', '.kt',
+    '.scala', '.r', '.m', '.sh', '.bash', '.zsh', '.fish', '.ps1',
+    '.sql', '.html', '.css', '.scss', '.less', '.json', '.yaml',
+    '.yml', '.toml', '.ini', '.cfg', '.conf', '.txt', '.md', '.rst',
+    '.lua', '.vim', '.el', '.clj', '.ex', '.exs', '.erl', '.hs',
+    '.ml', '.fs', '.dart', '.groovy', '.v', '.sv', '.vhd', '.tcl',
+}
+
+
+def ensure_cwd_dirs():
+    """Create input/, output/, tmp/ in CWD if they don't exist."""
+    for d in (INPUT_DIR, OUTPUT_DIR, TMP_DIR):
+        os.makedirs(d, exist_ok=True)
 
 
 # ═══════════════════════════════ THEMES ═══════════════════════════════
@@ -468,17 +495,23 @@ class TypingAnimator:
 # ═══════════════════════════ VIDEO EXPORTER ═══════════════════════════
 
 class VideoExporter(QThread):
-    progress = Signal(int); status = Signal(str); finished = Signal(str); error = Signal(str)
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal(str)
+    error = Signal(str)
 
     def __init__(self, code, output, renderer, animator, fps=30,
-                 sound_gen=None, volume=0.5, codec_profile="YouTube 1080p", crf=18, preset="medium"):
+                 sound_gen=None, volume=0.5, codec_profile="YouTube 1080p",
+                 crf=18, preset="medium"):
         super().__init__()
         self.logger = logging.getLogger("VideoExporter")
-        self.code = code; self.output = output; self.renderer = renderer; self.animator = animator
-        self.fps = fps; self.sound_gen = sound_gen; self.volume = volume
-        self.codec_profile = codec_profile; self.crf = crf; self.preset = preset
-        self._cancel = False
-        self.logger.info(f"Exporter initialized. Output: {output}, FPS: {fps}, Codec: {codec_profile}, CRF: {crf}, Preset: {preset}")
+        self.code = code; self.output = output; self.renderer = renderer
+        self.animator = animator; self.fps = fps; self.sound_gen = sound_gen
+        self.volume = volume; self.codec_profile = codec_profile
+        self.crf = crf; self.preset = preset; self._cancel = False
+        self.logger.info(
+            f"Exporter initialized. Output: {output}, FPS: {fps}, "
+            f"Codec: {codec_profile}, CRF: {crf}, Preset: {preset}")
 
     def cancel(self):
         self.logger.warning("Cancel signal received! Stopping export...")
@@ -486,108 +519,262 @@ class VideoExporter(QThread):
 
     def _check_ffmpeg(self):
         try:
-            r = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+            r = subprocess.run(['ffmpeg', '-version'],
+                               capture_output=True, timeout=5)
             return r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
-    def _qimg_to_frame(self, qimg):
+    # ── QImage → raw bytes ──────────────────────────────────────
+
+    def _qimg_to_raw_rgb(self, qimg):
+        """Extract contiguous RGB888 bytes from a QImage.
+        Handles both old sip.voidptr and new memoryview returns."""
         qimg = qimg.convertToFormat(QImage.Format_RGB888)
-        ptr = qimg.constBits(); bpl = qimg.bytesPerLine(); ptr.setsize(qimg.height() * bpl)
-        arr = np.array(ptr).reshape((qimg.height(), bpl))
-        arr = arr[:, :qimg.width() * 3].reshape((qimg.height(), qimg.width(), 3))
+        w, h = qimg.width(), qimg.height()
+        bpl = qimg.bytesPerLine()
+        ptr = qimg.constBits()
+
+        if isinstance(ptr, memoryview):
+            # PySide6 >= 6.5 returns memoryview — use tobytes()
+            raw = ptr.tobytes()
+            if len(raw) < h * bpl:
+                return self._qimg_to_raw_rgb_scanline(qimg, w, h, bpl)
+        elif hasattr(ptr, 'setsize'):
+            # Older PySide6 returns sip.voidptr
+            ptr.setsize(h * bpl)
+            arr = np.array(ptr, dtype=np.uint8).reshape((h, bpl))
+            if bpl != w * 3:
+                arr = arr[:, :w * 3]
+            return np.ascontiguousarray(arr).tobytes()
+        else:
+            raw = ptr.tobytes() if hasattr(ptr, 'tobytes') else bytes(ptr)
+
+        raw = raw[:h * bpl]
+        if bpl == w * 3:
+            return raw
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpl))
+        return np.ascontiguousarray(arr[:, :w * 3]).tobytes()
+
+    def _qimg_to_raw_rgb_scanline(self, qimg, w, h, bpl):
+        """Fallback: build RGB bytes row-by-row via scanLine()."""
+        rows = []
+        for y in range(h):
+            scan = qimg.scanLine(y)
+            if isinstance(scan, memoryview):
+                rows.append(scan.tobytes()[:w * 3])
+            elif hasattr(scan, 'setsize'):
+                scan.setsize(bpl)
+                rows.append(bytes(scan)[:w * 3])
+            else:
+                rows.append(bytes(scan)[:w * 3])
+        return b''.join(rows)
+
+    def _qimg_to_frame(self, qimg):
+        """Convert QImage → OpenCV BGR frame (for Raw MP4V fallback)."""
+        raw = self._qimg_to_raw_rgb(qimg)
+        w, h = qimg.width(), qimg.height()
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+    # ── Frame rendering helper ──────────────────────────────────
+
+    def _render_frame_at(self, t, blink_period=0.53):
+        nv = self.animator.visible_at(t)
+        cur_vis = True; last_ts = 0
+        for ts, idx, _ in self.animator.timeline:
+            if idx == nv - 1:
+                last_ts = ts; break
+        since = t - last_ts
+        if since > 0.25:
+            cur_vis = (int(since / blink_period) % 2) == 0
+        return self.renderer.render_frame(self.code, nv, cur_vis)
+
+    # ── Main export entry point ─────────────────────────────────
+
     def run(self):
+        tmp = None
         try:
-            tmp = tempfile.mkdtemp()
-            vid_path = os.path.join(tmp, "video_only.mp4")
+            # Temp dir in CWD/tmp/
+            os.makedirs(TMP_DIR, exist_ok=True)
+            tmp = tempfile.mkdtemp(dir=TMP_DIR, prefix='export_')
             aud_path = os.path.join(tmp, "audio.wav")
-            total = self.animator.duration(); n_frames = int(total * self.fps); blink_period = 0.53
+            total = self.animator.duration()
+            n_frames = int(total * self.fps)
+            blink_period = 0.53
             w, h = self.renderer.width, self.renderer.height
-            self.logger.info(f"Starting frame rendering. Total frames: {n_frames}, Resolution: {w}x{h}")
 
-            if self.sound_gen: self.sound_gen.generate_audio_track(self.animator.char_timestamps(), aud_path, self.volume)
+            self.logger.info(
+                f"Starting export. Frames: {n_frames}, "
+                f"Resolution: {w}x{h}, Duration: {total:.1f}s")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(vid_path, fourcc, self.fps, (w, h))
-            export_start = _time.time()
-
-            for fi in range(n_frames):
-                if self._cancel:
-                    writer.release(); self.error.emit("Cancelled"); return
-
-                t = fi / self.fps; nv = self.animator.visible_at(t); cur_vis = True; last_ts = 0
-                for ts, idx, _ in self.animator.timeline:
-                    if idx == nv - 1: last_ts = ts; break
-                since = t - last_ts
-                if since > 0.25: cur_vis = (int(since / blink_period) % 2) == 0
-
-                qimg = self.renderer.render_frame(self.code, nv, cur_vis)
-                frame = self._qimg_to_frame(qimg); writer.write(frame)
-                pct = int((fi + 1) / n_frames * 100); self.progress.emit(pct)
-                if fi % max(1, n_frames // 20) == 0 and fi > 0:
-                    elapsed = _time.time() - export_start; eta = elapsed / (fi + 1) * (n_frames - fi - 1)
-                    msg = f"Rendering frames... {pct}%  (ETA: {int(eta)}s)"
-                    self.status.emit(msg); self.logger.debug(msg)
-
-            writer.release()
-            self.logger.info(f"OpenCV video writing complete. Temp file: {vid_path}")
+            if self.sound_gen:
+                self.sound_gen.generate_audio_track(
+                    self.animator.char_timestamps(), aud_path, self.volume)
 
             has_ffmpeg = self._check_ffmpeg()
-            has_audio = (self.sound_gen is not None and os.path.exists(aud_path) and os.path.getsize(aud_path) > 0)
+            has_audio = (self.sound_gen is not None
+                         and os.path.exists(aud_path)
+                         and os.path.getsize(aud_path) > 0)
 
             if self.codec_profile == "Raw (Uncompressed MP4V)":
-                self.logger.info("Raw profile selected. Skipping FFmpeg. Copying raw MP4V...")
-                shutil.copy2(vid_path, self.output); self.finished.emit(self.output)
-                try: shutil.rmtree(tmp, ignore_errors=True)
-                except: pass
-                return
-
-            if not has_ffmpeg:
-                self.error.emit("FFmpeg is required for H.264/YouTube exports but was not found.")
-                try: shutil.rmtree(tmp, ignore_errors=True)
-                except: pass
-                return
-
-            self.logger.info("Starting FFmpeg processing...")
-            success = False
-            vcodec = 'libx264'
-            vprofile = 'high' if self.codec_profile == "YouTube 1080p" else 'main'
-            acodec = 'aac'
-            vargs = ['-c:v', vcodec, '-profile:v', vprofile, '-preset', self.preset, 
-                     '-crf', str(self.crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart']
-
-            if has_audio:
-                cmd = ['ffmpeg', '-y', '-i', vid_path, '-i', aud_path] + vargs + ['-c:a', acodec, '-b:a', '192k', '-shortest', self.output]
+                self._export_raw(tmp, n_frames, w, h, blink_period)
+            elif has_ffmpeg:
+                self._export_ffmpeg_pipe(
+                    tmp, aud_path, n_frames, w, h, has_audio, blink_period)
             else:
-                cmd = ['ffmpeg', '-y', '-i', vid_path] + vargs + [self.output]
-
-            self.logger.debug(f"Executing FFmpeg command: {' '.join(cmd)}")
-            r = subprocess.run(cmd, capture_output=True, timeout=600)
-            if r.returncode == 0:
-                success = True; self.logger.info("FFmpeg processing successful.")
-            else:
-                err_msg = r.stderr.decode('utf-8', errors='ignore')[-500:]
-                self.logger.error(f"FFmpeg failed:\n{err_msg}")
-                self.status.emit("FFmpeg failed. Retrying with basic settings...")
-                cmd = ['ffmpeg', '-y', '-i', vid_path, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', self.output]
-                self.logger.debug(f"Executing FFmpeg Fallback command: {' '.join(cmd)}")
-                r = subprocess.run(cmd, capture_output=True, timeout=600)
-                if r.returncode == 0: success = True; self.logger.info("FFmpeg fallback successful.")
-                else: self.logger.error(f"FFmpeg fallback failed:\n{r.stderr.decode('utf-8', errors='ignore')[-500:]}")
-
-            if not success:
-                self.logger.warning("All FFmpeg attempts failed. Falling back to raw MP4V copy.")
-                shutil.copy2(vid_path, self.output)
-
-            try: shutil.rmtree(tmp, ignore_errors=True); self.logger.debug(f"Cleaned up temp dir: {tmp}")
-            except: pass
+                self.error.emit(
+                    "FFmpeg is required for H.264/YouTube exports "
+                    "but was not found on PATH.")
+                shutil.rmtree(tmp, ignore_errors=True); tmp = None
+                return
 
             self.finished.emit(self.output)
+            try:
+                shutil.rmtree(tmp, ignore_errors=True); tmp = None
+                self.logger.debug("Cleaned up temp dir.")
+            except Exception:
+                pass
+
         except Exception as e:
-            self.logger.critical(f"Export crashed: {str(e)}", exc_info=True)
+            self.logger.critical(f"Export crashed: {e}", exc_info=True)
             self.error.emit(str(e))
+            if tmp:
+                try: shutil.rmtree(tmp, ignore_errors=True)
+                except: pass
+
+    # ── FFmpeg pipe export (best quality, single-pass) ──────────
+
+    def _export_ffmpeg_pipe(self, tmp, aud_path, n_frames, w, h,
+                            has_audio, blink_period):
+        """Pipe raw RGB frames directly to FFmpeg — no intermediate
+        lossy mp4v file, single H.264 encoding pass = best quality."""
+
+        self.logger.info("Exporting via FFmpeg pipe (single-pass H.264)...")
+
+        vprofile = 'high' if 'YouTube' in self.codec_profile else 'main'
+        vlevel = '4.2' if 'YouTube' in self.codec_profile else '4.1'
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s', f'{w}x{h}', '-r', str(self.fps),
+            '-i', 'pipe:0',
+        ]
+        if has_audio:
+            cmd += ['-i', aud_path]
+
+        cmd += [
+            '-c:v', 'libx264',
+            '-profile:v', vprofile,
+            '-level', vlevel,
+            '-preset', self.preset,
+            '-crf', str(self.crf),
+            '-pix_fmt', 'yuv420p',
+            '-bf', '2',
+            '-refs', '4',
+            '-movflags', '+faststart',
+        ]
+        if has_audio:
+            cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
+        cmd.append(self.output)
+
+        self.logger.info(f"FFmpeg: {' '.join(cmd)}")
+
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        stderr_chunks = []
+        def _drain():
+            while True:
+                chunk = proc.stderr.read(8192)
+                if not chunk: break
+                stderr_chunks.append(chunk)
+        drain_t = threading.Thread(target=_drain, daemon=True)
+        drain_t.start()
+
+        export_start = _time.time()
+        frame_size = w * h * 3
+
+        try:
+            for fi in range(n_frames):
+                if self._cancel:
+                    try: proc.stdin.close()
+                    except: pass
+                    proc.terminate()
+                    self.error.emit("Cancelled")
+                    return
+
+                t = fi / self.fps
+                qimg = self._render_frame_at(t, blink_period)
+                raw = self._qimg_to_raw_rgb(qimg)
+
+                if len(raw) != frame_size:
+                    raise RuntimeError(
+                        f"Frame {fi}: size {len(raw)} != expected {frame_size}")
+
+                try:
+                    proc.stdin.write(raw)
+                except BrokenPipeError:
+                    self.logger.error("FFmpeg pipe broken during write.")
+                    break
+
+                pct = int((fi + 1) / n_frames * 100)
+                self.progress.emit(pct)
+                if fi % max(1, n_frames // 20) == 0 and fi > 0:
+                    elapsed = _time.time() - export_start
+                    eta = elapsed / (fi + 1) * (n_frames - fi - 1)
+                    msg = f"Encoding... {pct}% (ETA: {int(eta)}s)"
+                    self.status.emit(msg)
+                    self.logger.debug(msg)
+
+            try: proc.stdin.close()
+            except: pass
+            proc.wait(timeout=600)
+            drain_t.join(timeout=5)
+
+            if proc.returncode != 0:
+                err = b''.join(stderr_chunks).decode(
+                    'utf-8', errors='ignore')[-800:]
+                self.logger.error(f"FFmpeg rc={proc.returncode}: {err}")
+                raise RuntimeError(f"FFmpeg encoding failed: {err}")
+
+            elapsed = _time.time() - export_start
+            self.logger.info(
+                f"FFmpeg export complete. {n_frames} frames in "
+                f"{elapsed:.1f}s ({n_frames/elapsed:.1f} fps avg)")
+
+        except Exception:
+            try: proc.stdin.close()
+            except: pass
+            proc.terminate()
+            raise
+
+    # ── Raw MP4V fallback (OpenCV only, no re-encode) ──────────
+
+    def _export_raw(self, tmp, n_frames, w, h, blink_period):
+        vid_path = os.path.join(tmp, "video_only.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(vid_path, fourcc, self.fps, (w, h))
+        export_start = _time.time()
+
+        for fi in range(n_frames):
+            if self._cancel:
+                writer.release(); self.error.emit("Cancelled"); return
+            t = fi / self.fps
+            qimg = self._render_frame_at(t, blink_period)
+            frame = self._qimg_to_frame(qimg); writer.write(frame)
+            pct = int((fi + 1) / n_frames * 100); self.progress.emit(pct)
+            if fi % max(1, n_frames // 20) == 0 and fi > 0:
+                elapsed = _time.time() - export_start
+                eta = elapsed / (fi + 1) * (n_frames - fi - 1)
+                msg = f"Rendering... {pct}% (ETA: {int(eta)}s)"
+                self.status.emit(msg); self.logger.debug(msg)
+
+        writer.release()
+        shutil.copy2(vid_path, self.output)
+        self.logger.info(f"Raw MP4V written to: {self.output}")
 
 
 # ═══════════════════════════ MAIN WINDOW ═══════════════════════════
@@ -599,29 +786,54 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Code Typing Video Generator")
         self.setMinimumSize(1350, 850)
 
+        # ── Ensure CWD folders exist ──
+        ensure_cwd_dirs()
+
         self.is_playing = False; self.animator = None; self.renderer = None
         self.sound_gen = TypingSoundGenerator(profile="Mechanical")
-        self.exporter = None; self._last_vis = 0; self._play_t0 = 0.0; self._play_offset = 0.0
+        self.exporter = None; self._last_vis = 0; self._play_t0 = 0.0
+        self._play_offset = 0.0; self._current_input_file = None
+        self._sfx_dir = None; self._sfx = {}
 
-        self._preview_timer = QTimer(self); self._preview_timer.setInterval(16); self._preview_timer.timeout.connect(self._tick)
-        self._code_debounce = QTimer(self); self._code_debounce.setSingleShot(True); self._code_debounce.setInterval(400)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(16)
+        self._preview_timer.timeout.connect(self._tick)
+        self._code_debounce = QTimer(self)
+        self._code_debounce.setSingleShot(True)
+        self._code_debounce.setInterval(400)
+        self._code_debounce.timeout.connect(self._static_preview)
 
         self.logger.info("Initializing UI and Sounds...")
+        self._build_ui()
+        self._build_menu()
+        self._build_shortcuts()
         self._init_sounds()
-        self._build_ui(); self._build_menu(); self._build_shortcuts()
-        self._restore_settings(); self._static_preview()
+        self._restore_settings()
+        self._refresh_input_files()
+        self._static_preview()
         self.logger.info("Application startup complete.")
 
+    # ── Sound system ────────────────────────────────────────────
+
     def _init_sounds(self, profile="Mechanical"):
-        tmp = tempfile.mkdtemp(); self._sfx_dir = tmp; self._sfx = {}
+        # Clean up old sfx dir
+        if self._sfx_dir and os.path.isdir(self._sfx_dir):
+            try: shutil.rmtree(self._sfx_dir, ignore_errors=True)
+            except: pass
+
+        os.makedirs(TMP_DIR, exist_ok=True)
+        self._sfx_dir = tempfile.mkdtemp(dir=TMP_DIR, prefix='sfx_')
+        self._sfx = {}
         self.sound_gen = TypingSoundGenerator(profile=profile)
         volume = self.snd_vol_sl.value() / 100.0 if hasattr(self, 'snd_vol_sl') else 0.5
         self.logger.info(f"Initializing preview sounds (Profile: {profile}, Vol: {volume:.2f})")
         for kind in ('key', 'space', 'enter'):
             for i, snd in enumerate(self.sound_gen.sounds[kind][:3]):
-                path = os.path.join(tmp, f"{kind}_{i}.wav")
+                path = os.path.join(self._sfx_dir, f"{kind}_{i}.wav")
                 self.sound_gen.save_wav(path, snd, volume=volume)
-                eff = QSoundEffect(self); eff.setSource(QUrl.fromLocalFile(os.path.abspath(path))); eff.setVolume(0.8)
+                eff = QSoundEffect(self)
+                eff.setSource(QUrl.fromLocalFile(os.path.abspath(path)))
+                eff.setVolume(0.8)
                 self._sfx[(kind, i)] = eff
 
     def _play_click(self, ch):
@@ -629,113 +841,461 @@ class MainWindow(QMainWindow):
         key = (kind, random.randint(0, 2)); sfx = self._sfx.get(key)
         if sfx: sfx.play()
 
+    # ── Input / Output folder helpers ───────────────────────────
+
+    def _scan_input_folder(self):
+        """Return sorted list of (display_name, full_path) for files in input/."""
+        files = []
+        if not os.path.isdir(INPUT_DIR):
+            return files
+        for fname in sorted(os.listdir(INPUT_DIR), key=str.lower):
+            fpath = os.path.join(INPUT_DIR, fname)
+            if os.path.isfile(fpath):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in SUPPORTED_EXTENSIONS or ext == '':
+                    files.append((fname, fpath))
+        return files
+
+    def _refresh_input_files(self):
+        """Re-scan input/ folder and update the combo box."""
+        self.input_file_cb.blockSignals(True)
+        current_data = self.input_file_cb.currentData()
+        self.input_file_cb.clear()
+        self.input_file_cb.addItem("— Select file from input/ —", None)
+
+        files = self._scan_input_folder()
+        selected_idx = 0
+        for i, (display, fpath) in enumerate(files):
+            size_kb = os.path.getsize(fpath) / 1024
+            label = f"{display}  ({size_kb:.1f} KB)"
+            self.input_file_cb.addItem(label, fpath)
+            if fpath == current_data:
+                selected_idx = i + 1  # +1 for the placeholder
+
+        if files:
+            self.input_file_cb.setCurrentIndex(selected_idx)
+        self.input_file_cb.blockSignals(False)
+
+        count = len(files)
+        self.logger.info(f"Scanned input/ folder: {count} file(s) found.")
+        self.statusBar().showMessage(
+            f"📂 input/ — {count} file(s)  |  📂 output/ — auto-export destination")
+
+    def _on_input_file_selected(self, index):
+        """Load selected file from input/ into the editor."""
+        fpath = self.input_file_cb.itemData(index)
+        if not fpath or not os.path.isfile(fpath):
+            return
+
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            self.editor.setPlainText(content)
+            self._current_input_file = fpath
+
+            # Auto-update window title to match filename
+            fname = os.path.basename(fpath)
+            self.title_edit.setText(f"{fname} — Code Editor")
+
+            self.logger.info(f"Loaded: {fpath}")
+            self.statusBar().showMessage(f"Loaded: {fname}")
+        except Exception as e:
+            self.logger.error(f"Failed to load {fpath}: {e}")
+            QMessageBox.warning(self, "Load Error", f"Could not read file:\n{e}")
+
+    def _save_to_input(self):
+        """Save current editor content as a new file in input/."""
+        code = self.editor.toPlainText()
+        if not code.strip():
+            QMessageBox.information(self, "Empty", "Nothing to save — editor is empty.")
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Save to input/", "Filename:",
+            text="snippet.py")
+        if not ok or not name.strip():
+            return
+
+        name = name.strip()
+        if not os.path.splitext(name)[1]:
+            name += ".py"
+
+        fpath = os.path.join(INPUT_DIR, name)
+        if os.path.exists(fpath):
+            resp = QMessageBox.question(
+                self, "Overwrite?",
+                f"'{name}' already exists in input/. Overwrite?",
+                QMessageBox.Yes | QMessageBox.No)
+            if resp != QMessageBox.Yes:
+                return
+
+        try:
+            with open(fpath, 'w', encoding='utf-8') as f:
+                f.write(code)
+            self._current_input_file = fpath
+            self._refresh_input_files()
+            # Select the newly saved file
+            for i in range(self.input_file_cb.count()):
+                if self.input_file_cb.itemData(i) == fpath:
+                    self.input_file_cb.setCurrentIndex(i)
+                    break
+            self.logger.info(f"Saved to: {fpath}")
+            self.statusBar().showMessage(f"Saved: {name} → input/")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Could not save file:\n{e}")
+
+    def _get_auto_output_path(self):
+        """Determine the automatic output path for export."""
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        if self._current_input_file and os.path.isfile(self._current_input_file):
+            base = os.path.splitext(os.path.basename(self._current_input_file))[0]
+        else:
+            base = "code_typing"
+
+        output_path = os.path.join(OUTPUT_DIR, f"{base}.mp4")
+
+        # Avoid overwriting: append _2, _3, etc.
+        if os.path.exists(output_path):
+            counter = 2
+            while os.path.exists(os.path.join(OUTPUT_DIR, f"{base}_{counter}.mp4")):
+                counter += 1
+            output_path = os.path.join(OUTPUT_DIR, f"{base}_{counter}.mp4")
+
+        return output_path
+
+    # ── UI construction ─────────────────────────────────────────
+
     def _build_ui(self):
-        cw = QWidget(); self.setCentralWidget(cw); root = QHBoxLayout(cw); root.setSpacing(8)
+        cw = QWidget(); self.setCentralWidget(cw)
+        root = QHBoxLayout(cw); root.setSpacing(8)
+
+        # ── Left panel ──
         left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(4, 4, 4, 4)
 
+        # ── Code Input group ──
         eg = QGroupBox("Code Input"); el = QVBoxLayout(eg)
-        self.editor = QTextEdit(); self.editor.setFont(QFont("Consolas", 11)); self.editor.setPlainText(self._sample_py())
-        self.editor.setAcceptRichText(False); self.editor.setStyleSheet("QTextEdit { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; }")
-        el.addWidget(self.editor); self.editor.textChanged.connect(self._on_code_changed)
+
+        # Input file row
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("📂 input/:"))
+        self.input_file_cb = QComboBox()
+        self.input_file_cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.input_file_cb.setStyleSheet(
+            "QComboBox{background:#1e1e2e;color:#cdd6f4;border:1px solid #45475a;"
+            "border-radius:4px;padding:4px 8px}"
+            "QComboBox::drop-down{border:none}"
+            "QComboBox QAbstractItemView{background:#1e1e2e;color:#cdd6f4;"
+            "selection-background-color:#45475a}")
+        self.input_file_cb.currentIndexChanged.connect(self._on_input_file_selected)
+        file_row.addWidget(self.input_file_cb, 1)
+
+        refresh_btn = QPushButton("🔄")
+        refresh_btn.setFixedWidth(32); refresh_btn.setToolTip("Refresh file list")
+        refresh_btn.clicked.connect(self._refresh_input_files)
+        refresh_btn.setStyleSheet(
+            "QPushButton{background:#333;color:#fff;border:1px solid #555;"
+            "border-radius:4px} QPushButton:hover{background:#555}")
+        file_row.addWidget(refresh_btn)
+
+        save_btn = QPushButton("💾 Save")
+        save_btn.setToolTip("Save editor content to input/ folder")
+        save_btn.clicked.connect(self._save_to_input)
+        save_btn.setStyleSheet(
+            "QPushButton{background:#4CAF50;color:#fff;border:none;"
+            "border-radius:4px;padding:4px 10px;font-weight:bold}"
+            "QPushButton:hover{background:#43a047}")
+        file_row.addWidget(save_btn)
+
+        browse_btn = QPushButton("📂")
+        browse_btn.setFixedWidth(32); browse_btn.setToolTip("Browse for file")
+        browse_btn.clicked.connect(self._load_file)
+        browse_btn.setStyleSheet(
+            "QPushButton{background:#333;color:#fff;border:1px solid #555;"
+            "border-radius:4px} QPushButton:hover{background:#555}")
+        file_row.addWidget(browse_btn)
+
+        el.addLayout(file_row)
+
+        # Editor
+        self.editor = QTextEdit()
+        self.editor.setFont(QFont("Consolas", 11))
+        self.editor.setPlainText(self._sample_py())
+        self.editor.setAcceptRichText(False)
+        self.editor.setStyleSheet(
+            "QTextEdit{background:#1e1e2e;color:#cdd6f4;"
+            "border:1px solid #45475a;border-radius:4px}")
+        el.addWidget(self.editor)
+        self.editor.textChanged.connect(self._on_code_changed)
+
+        # Sample buttons row
         bl = QHBoxLayout()
-        for label, fn in [("Python", self._sample_py), ("JavaScript", self._sample_js), ("Load File", self._load_file)]:
+        for label, fn in [("Python", self._sample_py),
+                          ("JavaScript", self._sample_js),
+                          ("Load File", self._load_file)]:
             b = QPushButton(label); b.clicked.connect(fn); bl.addWidget(b)
         el.addLayout(bl); ll.addWidget(eg, 3)
 
+        # ── Settings group ──
         sg = QGroupBox("Settings"); sl = QVBoxLayout(sg)
+
+        # Visuals
         vg = QGroupBox("Visuals"); vl = QFormLayout(vg)
-        self.theme_cb = QComboBox(); self.theme_cb.addItems(THEMES.keys()); self.theme_cb.currentTextChanged.connect(self._on_setting_changed); vl.addRow("Theme:", self.theme_cb)
-        self.font_cb = QFontComboBox(); self.font_cb.setFontFilters(QFontComboBox.MonospacedFonts); self.font_cb.setCurrentFont(QFont("Consolas")); self.font_cb.currentFontChanged.connect(self._on_setting_changed); vl.addRow("Font:", self.font_cb)
-        self.size_sp = QSpinBox(); self.size_sp.setRange(10, 48); self.size_sp.setValue(22); self.size_sp.valueChanged.connect(self._on_setting_changed); vl.addRow("Font Size:", self.size_sp)
-        self.tab_sp = QSpinBox(); self.tab_sp.setRange(2, 8); self.tab_sp.setValue(4); self.tab_sp.valueChanged.connect(self._on_setting_changed); vl.addRow("Tab Size:", self.tab_sp)
-        self.title_edit = QLineEdit("main.py — Code Editor"); self.title_edit.textChanged.connect(self._on_setting_changed); vl.addRow("Window Title:", self.title_edit)
-        self.ln_chk = QCheckBox("Line Numbers"); self.ln_chk.setChecked(True); self.ln_chk.toggled.connect(self._on_setting_changed); vl.addRow(self.ln_chk)
-        self.chrome_chk = QCheckBox("Window Chrome"); self.chrome_chk.setChecked(True); self.chrome_chk.toggled.connect(self._on_setting_changed); vl.addRow(self.chrome_chk)
+        self.theme_cb = QComboBox()
+        self.theme_cb.addItems(THEMES.keys())
+        self.theme_cb.currentTextChanged.connect(self._on_setting_changed)
+        vl.addRow("Theme:", self.theme_cb)
+        self.font_cb = QFontComboBox()
+        self.font_cb.setFontFilters(QFontComboBox.MonospacedFonts)
+        self.font_cb.setCurrentFont(QFont("Consolas"))
+        self.font_cb.currentFontChanged.connect(self._on_setting_changed)
+        vl.addRow("Font:", self.font_cb)
+        self.size_sp = QSpinBox(); self.size_sp.setRange(10, 48)
+        self.size_sp.setValue(22)
+        self.size_sp.valueChanged.connect(self._on_setting_changed)
+        vl.addRow("Font Size:", self.size_sp)
+        self.tab_sp = QSpinBox(); self.tab_sp.setRange(2, 8)
+        self.tab_sp.setValue(4)
+        self.tab_sp.valueChanged.connect(self._on_setting_changed)
+        vl.addRow("Tab Size:", self.tab_sp)
+        self.title_edit = QLineEdit("main.py — Code Editor")
+        self.title_edit.textChanged.connect(self._on_setting_changed)
+        vl.addRow("Window Title:", self.title_edit)
+        self.ln_chk = QCheckBox("Line Numbers"); self.ln_chk.setChecked(True)
+        self.ln_chk.toggled.connect(self._on_setting_changed)
+        vl.addRow(self.ln_chk)
+        self.chrome_chk = QCheckBox("Window Chrome"); self.chrome_chk.setChecked(True)
+        self.chrome_chk.toggled.connect(self._on_setting_changed)
+        vl.addRow(self.chrome_chk)
         sl.addWidget(vg)
 
+        # Animation & Sound
         ag = QGroupBox("Animation & Sound"); al = QFormLayout(ag)
-        self.wpm_sp = QSpinBox(); self.wpm_sp.setRange(20, 600); self.wpm_sp.setValue(100); self.wpm_sp.setSuffix(" WPM"); al.addRow("Speed:", self.wpm_sp)
-        self.human_chk = QCheckBox("Humanize Typing"); self.human_chk.setChecked(True); al.addRow(self.human_chk)
-        self.snd_chk = QCheckBox("Enable Sounds"); self.snd_chk.setChecked(True); al.addRow(self.snd_chk)
-        self.snd_profile_cb = QComboBox(); self.snd_profile_cb.addItems(["Mechanical", "Typewriter", "Soft Membrane"]); self.snd_profile_cb.currentTextChanged.connect(self._on_sound_profile_changed); al.addRow("Sound Profile:", self.snd_profile_cb)
-        vh = QHBoxLayout(); self.snd_vol_sl = QSlider(Qt.Horizontal); self.snd_vol_sl.setRange(0, 100); self.snd_vol_sl.setValue(50); self.snd_vol_lbl = QLabel("50%")
-        self.snd_vol_sl.valueChanged.connect(lambda v: (self.snd_vol_lbl.setText(f"{v}%"), self._update_volume())); vh.addWidget(self.snd_vol_sl); vh.addWidget(self.snd_vol_lbl); al.addRow("Volume:", vh)
+        self.wpm_sp = QSpinBox(); self.wpm_sp.setRange(20, 600)
+        self.wpm_sp.setValue(100); self.wpm_sp.setSuffix(" WPM")
+        al.addRow("Speed:", self.wpm_sp)
+        self.human_chk = QCheckBox("Humanize Typing")
+        self.human_chk.setChecked(True); al.addRow(self.human_chk)
+        self.snd_chk = QCheckBox("Enable Sounds")
+        self.snd_chk.setChecked(True); al.addRow(self.snd_chk)
+        self.snd_profile_cb = QComboBox()
+        self.snd_profile_cb.addItems(["Mechanical", "Typewriter", "Soft Membrane"])
+        self.snd_profile_cb.currentTextChanged.connect(self._on_sound_profile_changed)
+        al.addRow("Sound Profile:", self.snd_profile_cb)
+        vh = QHBoxLayout()
+        self.snd_vol_sl = QSlider(Qt.Horizontal)
+        self.snd_vol_sl.setRange(0, 100); self.snd_vol_sl.setValue(50)
+        self.snd_vol_lbl = QLabel("50%")
+        self.snd_vol_sl.valueChanged.connect(
+            lambda v: (self.snd_vol_lbl.setText(f"{v}%"), self._update_volume()))
+        vh.addWidget(self.snd_vol_sl); vh.addWidget(self.snd_vol_lbl)
+        al.addRow("Volume:", vh)
         sl.addWidget(ag)
 
-        eg2 = QGroupBox("Export (YouTube Ready)"); el2 = QFormLayout(eg2)
-        self.res_cb = QComboBox(); self.res_cb.addItems(["1920x1080", "1280x720", "3840x2160", "1080x1920"]); el2.addRow("Resolution:", self.res_cb)
-        self.fps_sp = QSpinBox(); self.fps_sp.setRange(10, 60); self.fps_sp.setValue(30); self.fps_sp.setSuffix(" FPS"); el2.addRow("Frame Rate:", self.fps_sp)
-        self.codec_cb = QComboBox(); self.codec_cb.addItems(["YouTube 1080p", "High Quality (H.264)", "Raw (Uncompressed MP4V)"]); self.codec_cb.setCurrentText("YouTube 1080p"); el2.addRow("Codec:", self.codec_cb)
-        self.crf_sp = QSpinBox(); self.crf_sp.setRange(0, 51); self.crf_sp.setValue(18); el2.addRow("Quality (CRF):", self.crf_sp)
-        self.preset_cb = QComboBox(); self.preset_cb.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]); self.preset_cb.setCurrentText("medium"); el2.addRow("Speed (Preset):", self.preset_cb)
-        sl.addWidget(eg2); ll.addWidget(sg, 2); root.addWidget(left, 2)
+        # Export
+        eg2 = QGroupBox("Export → output/"); el2 = QFormLayout(eg2)
+        self.output_path_lbl = QLabel("output/code_typing.mp4")
+        self.output_path_lbl.setStyleSheet("color:#89b4fa;font-size:11px")
+        self.output_path_lbl.setWordWrap(True)
+        el2.addRow("Auto output:", self.output_path_lbl)
+        self.res_cb = QComboBox()
+        self.res_cb.addItems(["1920x1080", "1280x720", "3840x2160", "1080x1920"])
+        el2.addRow("Resolution:", self.res_cb)
+        self.fps_sp = QSpinBox(); self.fps_sp.setRange(10, 60)
+        self.fps_sp.setValue(30); self.fps_sp.setSuffix(" FPS")
+        el2.addRow("Frame Rate:", self.fps_sp)
+        self.codec_cb = QComboBox()
+        self.codec_cb.addItems([
+            "YouTube 1080p", "High Quality (H.264)", "Raw (Uncompressed MP4V)"])
+        self.codec_cb.setCurrentText("YouTube 1080p")
+        el2.addRow("Codec:", self.codec_cb)
+        self.crf_sp = QSpinBox(); self.crf_sp.setRange(0, 51)
+        self.crf_sp.setValue(18)
+        el2.addRow("Quality (CRF):", self.crf_sp)
+        self.preset_cb = QComboBox()
+        self.preset_cb.addItems([
+            "ultrafast", "superfast", "veryfast", "faster", "fast",
+            "medium", "slow", "slower", "veryslow"])
+        self.preset_cb.setCurrentText("medium")
+        el2.addRow("Speed (Preset):", self.preset_cb)
+        sl.addWidget(eg2)
 
+        ll.addWidget(sg, 2)
+        root.addWidget(left, 2)
+
+        # ── Right panel (preview) ──
         right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(4, 4, 4, 4)
         pg = QGroupBox("Preview"); pl = QVBoxLayout(pg)
-        self.preview = QLabel(); self.preview.setAlignment(Qt.AlignCenter); self.preview.setMinimumSize(640, 360)
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding); self.preview.setStyleSheet("background:#111; border-radius:8px;"); pl.addWidget(self.preview, 1)
-        self.seek_slider = QSlider(Qt.Horizontal); self.seek_slider.setRange(0, 10000); self.seek_slider.setValue(0)
-        self.seek_slider.setStyleSheet("QSlider::groove:horizontal{background:#333;height:6px;border-radius:3px} QSlider::handle:horizontal{background:#4CAF50;width:14px;margin:-4px 0;border-radius:7px} QSlider::sub-page:horizontal{background:#4CAF50;border-radius:3px}")
-        self.seek_slider.sliderPressed.connect(self._on_seek_pressed); self.seek_slider.sliderReleased.connect(self._on_seek_released); self.seek_slider.sliderMoved.connect(self._on_seek_moved); self._seeking = False
+        self.preview = QLabel(); self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(640, 360)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setStyleSheet("background:#111;border-radius:8px;")
+        pl.addWidget(self.preview, 1)
+
+        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, 10000); self.seek_slider.setValue(0)
+        self.seek_slider.setStyleSheet(
+            "QSlider::groove:horizontal{background:#333;height:6px;border-radius:3px}"
+            "QSlider::handle:horizontal{background:#4CAF50;width:14px;"
+            "margin:-4px 0;border-radius:7px}"
+            "QSlider::sub-page:horizontal{background:#4CAF50;border-radius:3px}")
+        self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
+        self.seek_slider.sliderReleased.connect(self._on_seek_released)
+        self.seek_slider.sliderMoved.connect(self._on_seek_moved)
+        self._seeking = False
         pl.addWidget(self.seek_slider)
+
         cl = QHBoxLayout()
-        self.play_btn = QPushButton("▶ Play"); self.play_btn.setFixedHeight(36); self.play_btn.setStyleSheet("QPushButton{background:#4CAF50;color:#fff;border:none;border-radius:5px;font-weight:bold;font-size:13px;padding:0 18px} QPushButton:hover{background:#43a047} QPushButton:disabled{background:#555}"); self.play_btn.clicked.connect(self._toggle_play); cl.addWidget(self.play_btn)
-        self.stop_btn = QPushButton("■ Stop"); self.stop_btn.setFixedHeight(36); self.stop_btn.setStyleSheet("QPushButton{background:#f44336;color:#fff;border:none;border-radius:5px;font-weight:bold;font-size:13px;padding:0 18px} QPushButton:hover{background:#d32f2f} QPushButton:disabled{background:#555}"); self.stop_btn.clicked.connect(self._stop); cl.addWidget(self.stop_btn)
-        self.time_lbl = QLabel("0:00 / 0:00"); self.time_lbl.setStyleSheet("color:#aaa;font-size:12px;padding:0 8px"); cl.addWidget(self.time_lbl); cl.addStretch()
-        self.export_btn = QPushButton("⬇ Export MP4"); self.export_btn.setFixedHeight(36); self.export_btn.setStyleSheet("QPushButton{background:#2196F3;color:#fff;border:none;border-radius:5px;font-weight:bold;font-size:13px;padding:0 22px} QPushButton:hover{background:#1976D2} QPushButton:disabled{background:#555}"); self.export_btn.clicked.connect(self._export); cl.addWidget(self.export_btn)
-        pl.addLayout(cl); self.progress = QProgressBar(); self.progress.setVisible(False); pl.addWidget(self.progress); rl.addWidget(pg); root.addWidget(right, 3)
-        self.statusBar().showMessage("Ready — paste code and click Play  |  Shortcuts: Space=Play  Esc=Stop  Ctrl+E=Export  Ctrl+O=Open")
+        self.play_btn = QPushButton("▶ Play"); self.play_btn.setFixedHeight(36)
+        self.play_btn.setStyleSheet(
+            "QPushButton{background:#4CAF50;color:#fff;border:none;"
+            "border-radius:5px;font-weight:bold;font-size:13px;padding:0 18px}"
+            "QPushButton:hover{background:#43a047}"
+            "QPushButton:disabled{background:#555}")
+        self.play_btn.clicked.connect(self._toggle_play)
+        cl.addWidget(self.play_btn)
+
+        self.stop_btn = QPushButton("■ Stop"); self.stop_btn.setFixedHeight(36)
+        self.stop_btn.setStyleSheet(
+            "QPushButton{background:#f44336;color:#fff;border:none;"
+            "border-radius:5px;font-weight:bold;font-size:13px;padding:0 18px}"
+            "QPushButton:hover{background:#d32f2f}"
+            "QPushButton:disabled{background:#555}")
+        self.stop_btn.clicked.connect(self._stop)
+        cl.addWidget(self.stop_btn)
+
+        self.time_lbl = QLabel("0:00 / 0:00")
+        self.time_lbl.setStyleSheet("color:#aaa;font-size:12px;padding:0 8px")
+        cl.addWidget(self.time_lbl); cl.addStretch()
+
+        self.export_btn = QPushButton("⬇ Export MP4"); self.export_btn.setFixedHeight(36)
+        self.export_btn.setStyleSheet(
+            "QPushButton{background:#2196F3;color:#fff;border:none;"
+            "border-radius:5px;font-weight:bold;font-size:13px;padding:0 22px}"
+            "QPushButton:hover{background:#1976D2}"
+            "QPushButton:disabled{background:#555}")
+        self.export_btn.clicked.connect(self._export)
+        cl.addWidget(self.export_btn)
+
+        pl.addLayout(cl)
+        self.progress = QProgressBar(); self.progress.setVisible(False)
+        pl.addWidget(self.progress)
+        rl.addWidget(pg)
+        root.addWidget(right, 3)
+
+        self.statusBar().showMessage(
+            "📂 input/ → load files  |  📂 output/ → auto-export  |  "
+            "Shortcuts: Space=Play  Esc=Stop  Ctrl+E=Export  Ctrl+O=Open")
 
     def _build_menu(self):
-        mb = self.menuBar(); fm = mb.addMenu("File"); a = QAction("Load Code...", self); a.triggered.connect(self._load_file); fm.addAction(a); fm.addSeparator(); a = QAction("Exit", self); a.triggered.connect(self.close); fm.addAction(a)
+        mb = self.menuBar()
+        fm = mb.addMenu("File")
+        a = QAction("Open File...", self); a.triggered.connect(self._load_file)
+        fm.addAction(a)
+        a = QAction("Refresh input/ Folder", self)
+        a.triggered.connect(self._refresh_input_files)
+        fm.addAction(a)
+        fm.addSeparator()
+        a = QAction("Open input/ Folder", self)
+        a.triggered.connect(lambda: os.startfile(INPUT_DIR) if sys.platform == 'win32' else None)
+        fm.addAction(a)
+        a = QAction("Open output/ Folder", self)
+        a.triggered.connect(lambda: os.startfile(OUTPUT_DIR) if sys.platform == 'win32' else None)
+        fm.addAction(a)
+        fm.addSeparator()
+        a = QAction("Exit", self); a.triggered.connect(self.close)
+        fm.addAction(a)
 
     def _build_shortcuts(self):
-        QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_play); QShortcut(QKeySequence(Qt.Key_Escape), self, self._stop)
-        QShortcut(QKeySequence("Ctrl+E"), self, self._export); QShortcut(QKeySequence("Ctrl+O"), self, self._load_file)
+        QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_play)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, self._stop)
+        QShortcut(QKeySequence("Ctrl+E"), self, self._export)
+        QShortcut(QKeySequence("Ctrl+O"), self, self._load_file)
+        QShortcut(QKeySequence("Ctrl+R"), self, self._refresh_input_files)
+        QShortcut(QKeySequence("Ctrl+S"), self, self._save_to_input)
+
+    # ── Settings persistence ────────────────────────────────────
 
     def _restore_settings(self):
-        s = QSettings("CodeTypingVideo", "CodeTypingVideo"); self.theme_cb.setCurrentText(s.value("theme", "Dracula", type=str)); self.font_cb.setCurrentFont(QFont(s.value("font", "Consolas", type=str)))
-        self.size_sp.setValue(s.value("font_size", 22, type=int)); self.wpm_sp.setValue(s.value("wpm", 100, type=int)); self.fps_sp.setValue(s.value("fps", 30, type=int)); self.tab_sp.setValue(s.value("tab_size", 4, type=int))
-        self.res_cb.setCurrentText(s.value("resolution", "1920x1080", type=str)); self.ln_chk.setChecked(s.value("line_numbers", True, type=bool)); self.chrome_chk.setChecked(s.value("window_chrome", True, type=bool))
-        self.human_chk.setChecked(s.value("humanize", True, type=bool)); self.snd_chk.setChecked(s.value("sounds", True, type=bool)); self.snd_profile_cb.setCurrentText(s.value("snd_profile", "Mechanical", type=str))
-        self.snd_vol_sl.setValue(s.value("snd_volume", 50, type=int)); self.title_edit.setText(s.value("title_text", "main.py — Code Editor", type=str)); self.codec_cb.setCurrentText(s.value("codec", "YouTube 1080p", type=str))
-        self.crf_sp.setValue(s.value("crf", 18, type=int)); self.preset_cb.setCurrentText(s.value("preset", "medium", type=str))
+        s = QSettings("CodeTypingVideo", "CodeTypingVideo")
+        self.theme_cb.setCurrentText(s.value("theme", "Dracula", type=str))
+        self.font_cb.setCurrentFont(QFont(s.value("font", "Consolas", type=str)))
+        self.size_sp.setValue(s.value("font_size", 22, type=int))
+        self.wpm_sp.setValue(s.value("wpm", 100, type=int))
+        self.fps_sp.setValue(s.value("fps", 30, type=int))
+        self.tab_sp.setValue(s.value("tab_size", 4, type=int))
+        self.res_cb.setCurrentText(s.value("resolution", "1920x1080", type=str))
+        self.ln_chk.setChecked(s.value("line_numbers", True, type=bool))
+        self.chrome_chk.setChecked(s.value("window_chrome", True, type=bool))
+        self.human_chk.setChecked(s.value("humanize", True, type=bool))
+        self.snd_chk.setChecked(s.value("sounds", True, type=bool))
+        self.snd_profile_cb.setCurrentText(
+            s.value("snd_profile", "Mechanical", type=str))
+        self.snd_vol_sl.setValue(s.value("snd_volume", 50, type=int))
+        self.title_edit.setText(
+            s.value("title_text", "main.py — Code Editor", type=str))
+        self.codec_cb.setCurrentText(s.value("codec", "YouTube 1080p", type=str))
+        self.crf_sp.setValue(s.value("crf", 18, type=int))
+        self.preset_cb.setCurrentText(s.value("preset", "medium", type=str))
         geo = s.value("geometry")
         if geo: self.restoreGeometry(geo)
+        self._update_output_path_label()
         self.logger.info("User settings restored.")
 
     def _save_settings(self):
-        s = QSettings("CodeTypingVideo", "CodeTypingVideo"); s.setValue("theme", self.theme_cb.currentText()); s.setValue("font", self.font_cb.currentFont().family()); s.setValue("font_size", self.size_sp.value())
-        s.setValue("wpm", self.wpm_sp.value()); s.setValue("fps", self.fps_sp.value()); s.setValue("tab_size", self.tab_sp.value()); s.setValue("resolution", self.res_cb.currentText())
-        s.setValue("line_numbers", self.ln_chk.isChecked()); s.setValue("window_chrome", self.chrome_chk.isChecked()); s.setValue("humanize", self.human_chk.isChecked()); s.setValue("sounds", self.snd_chk.isChecked())
-        s.setValue("snd_profile", self.snd_profile_cb.currentText()); s.setValue("snd_volume", self.snd_vol_sl.value()); s.setValue("title_text", self.title_edit.text()); s.setValue("codec", self.codec_cb.currentText())
-        s.setValue("crf", self.crf_sp.value()); s.setValue("preset", self.preset_cb.currentText()); s.setValue("geometry", self.saveGeometry())
+        s = QSettings("CodeTypingVideo", "CodeTypingVideo")
+        s.setValue("theme", self.theme_cb.currentText())
+        s.setValue("font", self.font_cb.currentFont().family())
+        s.setValue("font_size", self.size_sp.value())
+        s.setValue("wpm", self.wpm_sp.value())
+        s.setValue("fps", self.fps_sp.value())
+        s.setValue("tab_size", self.tab_sp.value())
+        s.setValue("resolution", self.res_cb.currentText())
+        s.setValue("line_numbers", self.ln_chk.isChecked())
+        s.setValue("window_chrome", self.chrome_chk.isChecked())
+        s.setValue("humanize", self.human_chk.isChecked())
+        s.setValue("sounds", self.snd_chk.isChecked())
+        s.setValue("snd_profile", self.snd_profile_cb.currentText())
+        s.setValue("snd_volume", self.snd_vol_sl.value())
+        s.setValue("title_text", self.title_edit.text())
+        s.setValue("codec", self.codec_cb.currentText())
+        s.setValue("crf", self.crf_sp.value())
+        s.setValue("preset", self.preset_cb.currentText())
+        s.setValue("geometry", self.saveGeometry())
         self.logger.info("User settings saved.")
 
+    # ── Renderer / Animator factories ───────────────────────────
+
     def _make_renderer(self, preview=False):
-        res = self.res_cb.currentText().replace('\u00d7', 'x').replace('×', 'x'); w, h = map(int, res.split('x'))
-        if preview: scale = min(960 / w, 540 / h, 1.0); w, h = int(w * scale), int(h * scale); pad = max(20, int(30 * scale)); fs = max(8, int(self.size_sp.value() * scale))
-        else: pad = 50; fs = self.size_sp.value()
-        return CodeRenderer(width=w, height=h, theme_name=self.theme_cb.currentText(), font_family=self.font_cb.currentFont().family(), font_size=fs, show_line_numbers=self.ln_chk.isChecked(), show_window_chrome=self.chrome_chk.isChecked(), padding=pad, tab_size=self.tab_sp.value(), title_text=self.title_edit.text())
+        res = self.res_cb.currentText().replace('\u00d7', 'x').replace('×', 'x')
+        w, h = map(int, res.split('x'))
+        if preview:
+            scale = min(960 / w, 540 / h, 1.0)
+            w, h = int(w * scale), int(h * scale)
+            pad = max(20, int(30 * scale)); fs = max(8, int(self.size_sp.value() * scale))
+        else:
+            pad = 50; fs = self.size_sp.value()
+        return CodeRenderer(
+            width=w, height=h, theme_name=self.theme_cb.currentText(),
+            font_family=self.font_cb.currentFont().family(), font_size=fs,
+            show_line_numbers=self.ln_chk.isChecked(),
+            show_window_chrome=self.chrome_chk.isChecked(),
+            padding=pad, tab_size=self.tab_sp.value(),
+            title_text=self.title_edit.text())
 
     def _make_animator(self):
         code = self.editor.toPlainText().replace('\r\n', '\n').replace('\r', '\n')
-        return TypingAnimator(code, base_wpm=self.wpm_sp.value(), humanize=self.human_chk.isChecked())
+        return TypingAnimator(code, base_wpm=self.wpm_sp.value(),
+                              humanize=self.human_chk.isChecked())
+
+    # ── Event handlers ──────────────────────────────────────────
 
     def _on_code_changed(self):
         if self.is_playing: self._stop()
         self.animator = None; self._code_debounce.start()
-        self.logger.debug("Code editor text changed. Debouncing preview refresh.")
+        self._update_output_path_label()
 
     def _on_setting_changed(self, *args):
-        # Log the setting change. args might contain the new value.
-        sender = self.sender()
-        try:
-            val = args[0] if args else "Toggled"
-            self.logger.debug(f"Setting changed: {sender.objectName() if sender else 'Unknown'} -> {val}")
-        except:
-            pass
-        
         if self.is_playing: self._stop()
         self.animator = None; self._static_preview()
 
@@ -746,39 +1306,74 @@ class MainWindow(QMainWindow):
     def _update_volume(self):
         self._init_sounds(profile=self.snd_profile_cb.currentText())
 
+    def _update_output_path_label(self):
+        path = self._get_auto_output_path()
+        rel = os.path.relpath(path, CWD)
+        self.output_path_lbl.setText(rel)
+        self.output_path_lbl.setToolTip(path)
+
+    # ── Preview ─────────────────────────────────────────────────
+
     def _static_preview(self, *_):
         if self.is_playing: return
         try:
-            r = self._make_renderer(preview=True); code = self.editor.toPlainText()
-            if not code.strip(): self.preview.setText("<span style='color:#666;font-size:14px'>Paste some code to preview</span>"); return
-            img = r.render_frame(code, len(code), False); pm = QPixmap.fromImage(img)
-            self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            r = self._make_renderer(preview=True)
+            code = self.editor.toPlainText()
+            if not code.strip():
+                self.preview.setText(
+                    "<span style='color:#666;font-size:14px'>"
+                    "Paste code or select a file from input/</span>")
+                return
+            img = r.render_frame(code, len(code), False)
+            pm = QPixmap.fromImage(img)
+            self.preview.setPixmap(
+                pm.scaled(self.preview.size(),
+                          Qt.KeepAspectRatio, Qt.SmoothTransformation))
         except Exception as e:
             self.logger.error(f"Preview rendering error: {e}", exc_info=True)
             self.preview.setText(f"Preview error: {e}")
 
+    # ── Playback ────────────────────────────────────────────────
+
     def _toggle_play(self):
         if self.is_playing:
-            self.is_playing = False; self._preview_timer.stop(); self._play_offset += _time.time() - self._play_t0
-            self.play_btn.setText("▶ Play"); self.logger.info("Playback paused.")
+            self.is_playing = False; self._preview_timer.stop()
+            self._play_offset += _time.time() - self._play_t0
+            self.play_btn.setText("▶ Play")
+            self.logger.info("Playback paused.")
         else:
             self.is_playing = True
             if not self.animator:
-                self.animator = self._make_animator(); self.renderer = self._make_renderer(preview=True)
-                self._play_offset = 0.0; self._last_vis = 0; self.seek_slider.setRange(0, max(1, int(self.animator.duration() * 1000)))
-            self._play_t0 = _time.time(); self._preview_timer.start(); self.play_btn.setText("⏸ Pause"); self.logger.info("Playback started/resumed.")
+                self.animator = self._make_animator()
+                self.renderer = self._make_renderer(preview=True)
+                self._play_offset = 0.0; self._last_vis = 0
+                self.seek_slider.setRange(
+                    0, max(1, int(self.animator.duration() * 1000)))
+            self._play_t0 = _time.time()
+            self._preview_timer.start()
+            self.play_btn.setText("⏸ Pause")
+            self.logger.info("Playback started/resumed.")
 
     def _stop(self):
-        self.is_playing = False; self._preview_timer.stop(); self.animator = None; self.renderer = None
-        self._play_offset = 0.0; self._last_vis = 0; self.play_btn.setText("▶ Play"); self.seek_slider.setValue(0)
-        self._static_preview(); self.logger.info("Playback stopped.")
+        self.is_playing = False; self._preview_timer.stop()
+        self.animator = None; self.renderer = None
+        self._play_offset = 0.0; self._last_vis = 0
+        self.play_btn.setText("▶ Play")
+        self.seek_slider.setValue(0)
+        self._static_preview()
+        self.logger.info("Playback stopped.")
 
-    def _on_seek_pressed(self): self._seeking = True; self.logger.debug("Seeking started.")
-    def _on_seek_released(self): self._seeking = False; self.logger.debug("Seeking ended.")
+    def _on_seek_pressed(self):
+        self._seeking = True
+
+    def _on_seek_released(self):
+        self._seeking = False
 
     def _on_seek_moved(self, value):
         if not self.animator: return
-        t = value / 1000.0; self._play_offset = t; self._play_t0 = _time.time(); self._last_vis = self.animator.visible_at(t)
+        t = value / 1000.0
+        self._play_offset = t; self._play_t0 = _time.time()
+        self._last_vis = self.animator.visible_at(t)
         dur = self.animator.duration(); cur_vis = True
         if t < dur:
             nv = self.animator.visible_at(t); last_ts = 0
@@ -787,75 +1382,213 @@ class MainWindow(QMainWindow):
             since = t - last_ts
             if since > 0.2: cur_vis = (int(since / 0.53) % 2) == 0
             img = self.renderer.render_frame(self.animator.code, nv, cur_vis)
-            self.preview.setPixmap(QPixmap.fromImage(img).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.time_lbl.setText(f"{int(t)//60}:{int(t)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}")
+            self.preview.setPixmap(
+                QPixmap.fromImage(img).scaled(
+                    self.preview.size(),
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.time_lbl.setText(
+                f"{int(t)//60}:{int(t)%60:02d} / "
+                f"{int(dur)//60}:{int(dur)%60:02d}")
 
     def _tick(self):
         if not self.animator or not self.renderer: return
-        t = self._play_offset + (_time.time() - self._play_t0); dur = self.animator.duration()
-        if t >= dur: self._stop(); self.statusBar().showMessage("Playback complete"); return
+        t = self._play_offset + (_time.time() - self._play_t0)
+        dur = self.animator.duration()
+        if t >= dur:
+            self._stop()
+            self.statusBar().showMessage("Playback complete")
+            return
         nv = self.animator.visible_at(t)
         if self.snd_chk.isChecked() and nv > self._last_vis:
             for i in range(max(self._last_vis, nv - 3), nv):
-                if i < len(self.animator.code): self._play_click(self.animator.code[i])
+                if i < len(self.animator.code):
+                    self._play_click(self.animator.code[i])
         self._last_vis = nv; last_ts = 0
         for ts, idx, _ in self.animator.timeline:
             if idx == nv - 1: last_ts = ts; break
         cur_vis = True; since = t - last_ts
         if since > 0.2: cur_vis = (int(since / 0.53) % 2) == 0
         img = self.renderer.render_frame(self.animator.code, nv, cur_vis)
-        self.preview.setPixmap(QPixmap.fromImage(img).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        if not self._seeking: self.seek_slider.blockSignals(True); self.seek_slider.setValue(int(t * 1000)); self.seek_slider.blockSignals(False)
-        self.time_lbl.setText(f"{int(t)//60}:{int(t)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}")
+        self.preview.setPixmap(
+            QPixmap.fromImage(img).scaled(
+                self.preview.size(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if not self._seeking:
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(int(t * 1000))
+            self.seek_slider.blockSignals(False)
+        self.time_lbl.setText(
+            f"{int(t)//60}:{int(t)%60:02d} / "
+            f"{int(dur)//60}:{int(dur)%60:02d}")
+
+    # ── File operations ─────────────────────────────────────────
+
+    def _load_file(self):
+        """Open file dialog, copy selected file to input/, and load it."""
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "Load Code File", INPUT_DIR,
+            "Code Files (*.py *.js *.ts *.java *.c *.cpp *.h *.go *.rs "
+            "*.rb *.php *.swift *.kt *.sql *.html *.css *.json *.yaml "
+            "*.txt *.md *.sh *.lua *.dart);;All Files (*)")
+        if not fpath: return
+
+        # Copy to input/ folder if not already there
+        fname = os.path.basename(fpath)
+        dest = os.path.join(INPUT_DIR, fname)
+        if os.path.abspath(fpath) != os.path.abspath(dest):
+            if os.path.exists(dest):
+                resp = QMessageBox.question(
+                    self, "Copy to input/?",
+                    f"'{fname}' already exists in input/. Overwrite?",
+                    QMessageBox.Yes | QMessageBox.No)
+                if resp != QMessageBox.Yes:
+                    # Load the file directly without copying
+                    self._load_file_path(fpath)
+                    return
+            try:
+                shutil.copy2(fpath, dest)
+                self.logger.info(f"Copied to input/: {fname}")
+            except Exception as e:
+                self.logger.warning(f"Could not copy to input/: {e}")
+
+        self._refresh_input_files()
+        self._load_file_path(dest)
+
+    def _load_file_path(self, fpath):
+        """Load a specific file path into the editor."""
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            self.editor.setPlainText(content)
+            self._current_input_file = fpath
+            fname = os.path.basename(fpath)
+            self.title_edit.setText(f"{fname} — Code Editor")
+            # Select in combo box
+            for i in range(self.input_file_cb.count()):
+                if self.input_file_cb.itemData(i) == fpath:
+                    self.input_file_cb.blockSignals(True)
+                    self.input_file_cb.setCurrentIndex(i)
+                    self.input_file_cb.blockSignals(False)
+                    break
+            self._update_output_path_label()
+            self.logger.info(f"Loaded: {fpath}")
+            self.statusBar().showMessage(f"Loaded: {fname}")
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", f"Could not read file:\n{e}")
+
+    # ── Export ──────────────────────────────────────────────────
 
     def _export(self):
         code = self.editor.toPlainText()
-        if not code.strip(): QMessageBox.warning(self, "Empty", "Enter some code first!"); return
-        codec_profile = self.codec_cb.currentText(); has_ffmpeg = False
-        try: has_ffmpeg = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5).returncode == 0
-        except: pass
-        if codec_profile != "Raw (Uncompressed MP4V)" and not has_ffmpeg:
-            QMessageBox.critical(self, "FFmpeg Required", "FFmpeg is required to export H.264/YouTube videos.\n\n1. Download FFmpeg from https://ffmpeg.org\n2. Add it to your system PATH.\n\nAlternatively, select 'Raw (Uncompressed MP4V)' but note that it will not have audio and is not optimized for YouTube.")
+        if not code.strip():
+            QMessageBox.warning(self, "Empty", "No code to export.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export Video", "code_typing.mp4", "MP4 (*.mp4)")
-        if not path: return
+        if self.exporter and self.exporter.isRunning():
+            QMessageBox.warning(self, "Busy", "Export already in progress.")
+            return
 
-        renderer = self._make_renderer(preview=False); animator = self._make_animator()
-        snd = self.sound_gen if (has_ffmpeg and self.snd_chk.isChecked()) else None; vol = self.snd_vol_sl.value() / 100.0
-        self.exporter = VideoExporter(code, path, renderer, animator, self.fps_sp.value(), snd, vol, codec_profile=codec_profile, crf=self.crf_sp.value(), preset=self.preset_cb.currentText())
-        self.exporter.progress.connect(self._on_prog); self.exporter.status.connect(self._on_export_status); self.exporter.finished.connect(self._on_done); self.exporter.error.connect(self._on_err)
-        self._set_controls_enabled(False); self.progress.setVisible(True); self.progress.setValue(0); self.statusBar().showMessage("Exporting...")
+        output_path = self._get_auto_output_path()
+
+        renderer = self._make_renderer(preview=False)
+        animator = self._make_animator()
+
+        self.exporter = VideoExporter(
+            code=code, output=output_path, renderer=renderer,
+            animator=animator, fps=self.fps_sp.value(),
+            sound_gen=self.sound_gen if self.snd_chk.isChecked() else None,
+            volume=self.snd_vol_sl.value() / 100.0,
+            codec_profile=self.codec_cb.currentText(),
+            crf=self.crf_sp.value(),
+            preset=self.preset_cb.currentText())
+
+        self.exporter.progress.connect(self._on_export_progress)
+        self.exporter.status.connect(self.statusBar().showMessage)
+        self.exporter.finished.connect(self._on_export_finished)
+        self.exporter.error.connect(self._on_export_error)
+
+        self._set_ui_enabled(False)
+        self.progress.setVisible(True); self.progress.setValue(0)
+
+        rel = os.path.relpath(output_path, CWD)
+        self.statusBar().showMessage(f"Exporting → {rel} ...")
+        self.logger.info(f"Export started → {output_path}")
         self.exporter.start()
 
-    def _set_controls_enabled(self, enabled): self.export_btn.setEnabled(enabled); self.play_btn.setEnabled(enabled); self.stop_btn.setEnabled(enabled); self.editor.setReadOnly(not enabled)
-    def _on_prog(self, pct): self.progress.setValue(pct)
-    def _on_export_status(self, msg): self.statusBar().showMessage(msg)
+    def _on_export_progress(self, pct):
+        self.progress.setValue(pct)
 
-    def _on_done(self, p):
-        self.progress.setVisible(False); self._set_controls_enabled(True); self.statusBar().showMessage(f"Exported → {p}")
-        self.logger.info(f"Export successfully finished: {p}")
-        QMessageBox.information(self, "Done", f"Video saved!\n\n{p}")
+    def _on_export_finished(self, path):
+        self._set_ui_enabled(True)
+        self.progress.setVisible(False)
+        rel = os.path.relpath(path, CWD)
+        self.statusBar().showMessage(f"✅ Export complete → {rel}")
+        self.logger.info(f"Export finished: {path}")
 
-    def _on_err(self, msg):
-        self.progress.setVisible(False); self._set_controls_enabled(True); self.statusBar().showMessage(f"Error: {msg}")
+        # Open output folder
+        if sys.platform == 'win32':
+            os.startfile(OUTPUT_DIR)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', OUTPUT_DIR])
+        else:
+            subprocess.Popen(['xdg-open', OUTPUT_DIR])
+
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Video saved to:\n{rel}\n\n"
+            f"Size: {os.path.getsize(path) / (1024*1024):.1f} MB")
+
+    def _on_export_error(self, msg):
+        self._set_ui_enabled(True)
+        self.progress.setVisible(False)
+        self.statusBar().showMessage(f"❌ Export failed")
         self.logger.error(f"Export error: {msg}")
         QMessageBox.critical(self, "Export Error", msg)
 
-    def _load_file(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Load Code", "", "Code (*.py *.js *.ts *.java *.cpp *.c *.go *.rs *.rb *.html *.css);;All (*)")
-        if p:
-            try: self.editor.setPlainText(open(p, encoding='utf-8').read()); self.statusBar().showMessage(f"Loaded {p}"); self.logger.info(f"File loaded: {p}"); self._static_preview()
-            except Exception as e: self.logger.error(f"Failed to load file {p}: {e}"); QMessageBox.warning(self, "Error", str(e))
+    def _set_ui_enabled(self, enabled):
+        for w in (self.editor, self.export_btn, self.play_btn,
+                  self.input_file_cb, self.theme_cb, self.font_cb,
+                  self.res_cb, self.codec_cb, self.wpm_sp, self.fps_sp):
+            w.setEnabled(enabled)
 
-    @staticmethod
-    def _sample_py():
-        return '''import numpy as np
+    # ── Window events ───────────────────────────────────────────
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.is_playing:
+            self._static_preview()
+
+    def closeEvent(self, event):
+        self._save_settings()
+        if self.exporter and self.exporter.isRunning():
+            self.exporter.cancel()
+            self.exporter.wait(3000)
+        # Clean up temp dirs
+        if self._sfx_dir and os.path.isdir(self._sfx_dir):
+            try: shutil.rmtree(self._sfx_dir, ignore_errors=True)
+            except: pass
+        # Clean up tmp/ export leftovers
+        if os.path.isdir(TMP_DIR):
+            try: shutil.rmtree(TMP_DIR, ignore_errors=True)
+            except: pass
+        super().closeEvent(event)
+
+    # ── Sample code ─────────────────────────────────────────────
+
+    def _sample_py(self):
+        return '''#!/usr/bin/env python3
+"""
+Code Typing Video Generator
+Creates satisfying videos of code being typed with sound effects.
+"""
+
+import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional
 
+
 @dataclass
 class Particle:
-    """A particle in the simulation."""
+    """A single particle in the simulation."""
     x: float
     y: float
     vx: float = 0.0
@@ -863,142 +1596,214 @@ class Particle:
     mass: float = 1.0
     color: str = "#ffffff"
 
-class ParticleSimulation:
+    def update(self, dt: float, gravity: float = 9.81):
+        """Update particle position using Verlet integration."""
+        self.vy += gravity * dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+    @property
+    def kinetic_energy(self) -> float:
+        return 0.5 * self.mass * (self.vx**2 + self.vy**2)
+
+
+class ParticleSystem:
+    """Manages a collection of particles with physics."""
+
     def __init__(self, width: int, height: int):
         self.width = width
         self.height = height
         self.particles: List[Particle] = []
-        self.gravity = 9.81
-        self.dt = 0.016
+        self.time = 0.0
 
-    def add_particle(self, x, y, **kwargs):
-        p = Particle(x=x, y=y, **kwargs)
-        self.particles.append(p)
-        return p
+    def add_particle(self, x: float, y: float, **kwargs) -> Particle:
+        particle = Particle(x=x, y=y, **kwargs)
+        self.particles.append(particle)
+        return particle
 
-    def update(self):
+    def step(self, dt: float = 0.016):
+        """Advance simulation by one timestep."""
+        self.time += dt
         for p in self.particles:
-            p.vy += self.gravity * self.dt
-            p.x += p.vx * self.dt
-            p.y += p.vy * self.dt
-
-            if p.y > self.height - 10:
-                p.y = self.height - 10
-                p.vy *= -0.8
-
-            if p.x < 10 or p.x > self.width - 10:
+            p.update(dt)
+            # Boundary collision
+            if p.y > self.height:
+                p.y = self.height
+                p.vy *= -0.8  # Energy loss on bounce
+            if p.x < 0 or p.x > self.width:
                 p.vx *= -0.9
 
-    def total_energy(self) -> float:
-        return sum(
-            0.5 * p.mass * (p.vx**2 + p.vy**2)
-            for p in self.particles
-        )
+    def find_nearest(self, x: float, y: float) -> Optional[Particle]:
+        """Find the particle closest to a point."""
+        if not self.particles:
+            return None
+        return min(self.particles,
+                   key=lambda p: (p.x - x)**2 + (p.y - y)**2)
 
-def main():
-    sim = ParticleSimulation(800, 600)
-    for _ in range(50):
-        sim.add_particle(
-            x=np.random.uniform(50, 750),
-            y=np.random.uniform(50, 300),
-            vx=np.random.uniform(-100, 100),
-            vy=np.random.uniform(-50, 50),
-        )
-    print(f"Particles: {len(sim.particles)}")
-    for step in range(1000):
-        sim.update()
-        if step % 100 == 0:
-            print(f"Step {step}: E={sim.total_energy():.1f}")
+    @property
+    def total_energy(self) -> float:
+        return sum(p.kinetic_energy for p in self.particles)
+
 
 if __name__ == "__main__":
-    main()'''
+    system = ParticleSystem(800, 600)
+    for i in range(50):
+        system.add_particle(
+            x=np.random.uniform(0, 800),
+            y=np.random.uniform(0, 300),
+            vx=np.random.uniform(-50, 50),
+            vy=np.random.uniform(-20, 20),
+            color=np.random.choice(["#ff6b6b", "#4ecdc4", "#45b7d1"])
+        )
 
-    @staticmethod
-    def _sample_js():
-        return '''class EventEmitter {
-  constructor() {
-    this.listeners = new Map();
+    for _ in range(300):
+        system.step(dt=0.016)
+
+    print(f"Total energy: {system.total_energy:.2f} J")
+    print(f"Particles: {len(system.particles)}")
+    print(f"Sim time: {system.time:.2f}s")
+'''
+
+    def _sample_js(self):
+        return '''/**
+ * Real-time Particle System
+ * High-performance canvas rendering with WebGL
+ */
+
+class ParticleSystem {
+  constructor(config = {}) {
+    this.particles = [];
+    this.maxCount = config.maxCount || 10000;
+    this.gravity = config.gravity || -9.81;
+    this.bounds = config.bounds || { width: 800, height: 600 };
+    this.gl = null;
+    this.buffers = {};
   }
 
-  on(event, callback) {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, []);
+  async init(canvas) {
+    this.gl = canvas.getContext("webgl2");
+    if (!this.gl) throw new Error("WebGL2 not supported");
+
+    this._setupShaders();
+    this._createBuffers();
+    return this;
+  }
+
+  _setupShaders() {
+    const vsSource = `#version 300 es
+      in vec2 a_position;
+      in vec4 a_color;
+      out vec4 v_color;
+      uniform mat4 u_projection;
+      void main() {
+        gl_Position = u_projection * vec4(a_position, 0.0, 1.0);
+        gl_PointSize = 3.0;
+        v_color = a_color;
+      }
+    `;
+
+    const fsSource = `#version 300 es
+      precision mediump float;
+      in vec4 v_color;
+      out vec4 fragColor;
+      void main() {
+        fragColor = v_color;
+      }
+    `;
+
+    this.program = this._compileProgram(vsSource, fsSource);
+  }
+
+  _compileProgram(vs, fs) {
+    const gl = this.gl;
+    const vert = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vert, vs);
+    gl.compileShader(vert);
+
+    const frag = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(frag, fs);
+    gl.compileShader(frag);
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vert);
+    gl.attachShader(prog, frag);
+    gl.linkProgram(prog);
+    return prog;
+  }
+
+  emit(count, origin, spread = 1.0) {
+    for (let i = 0; i < count; i++) {
+      if (this.particles.length >= this.maxCount) break;
+      this.particles.push({
+        x: origin.x + (Math.random() - 0.5) * spread * 50,
+        y: origin.y + (Math.random() - 0.5) * spread * 50,
+        vx: (Math.random() - 0.5) * 100,
+        vy: Math.random() * 80 + 20,
+        life: 1.0,
+        decay: 0.005 + Math.random() * 0.01,
+        r: Math.random(),
+        g: 0.5 + Math.random() * 0.5,
+        b: 0.8 + Math.random() * 0.2
+      });
     }
-    this.listeners.get(event).push(callback);
-    return this;
   }
 
-  off(event, callback) {
-    const cbs = this.listeners.get(event);
-    if (cbs) {
-      const i = cbs.indexOf(callback);
-      if (i > -1) cbs.splice(i, 1);
+  update(dt) {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.vy += this.gravity * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= p.decay;
+
+      if (p.life <= 0 || p.y < -10) {
+        this.particles.splice(i, 1);
+      }
     }
-    return this;
   }
 
-  emit(event, ...args) {
-    const cbs = this.listeners.get(event);
-    if (cbs) cbs.forEach(cb => cb(...args));
-    return this;
+  get count() {
+    return this.particles.length;
   }
 }
 
-function createStore(initialState) {
-  const emitter = new EventEmitter();
-  let state = { ...initialState };
-
-  return {
-    getState: () => ({ ...state }),
-    setState: (updates) => {
-      const prev = { ...state };
-      state = { ...state, ...updates };
-      emitter.emit("change", state, prev);
-    },
-    subscribe: (cb) => {
-      emitter.on("change", cb);
-      return () => emitter.off("change", cb);
-    }
-  };
-}
-
-const store = createStore({ count: 0, name: "World" });
-store.subscribe((s) => console.log("State:", s));
-store.setState({ count: 1 });
-store.setState({ name: "JavaScript" });'''
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if not self.is_playing: QTimer.singleShot(100, self._static_preview)
-
-    def closeEvent(self, e):
-        self.logger.info("Application closing. Saving settings and cleaning up...")
-        self._save_settings()
-        if self.exporter and self.exporter.isRunning(): self.exporter.cancel(); self.exporter.wait(3000)
-        e.accept()
+// Initialize and run
+const system = new ParticleSystem({ maxCount: 5000 });
+system.init(document.querySelector("canvas")).then(() => {
+  console.log("Particle system ready!");
+  console.log(`Max particles: ${system.maxCount}`);
+});
+'''
 
 
 # ═══════════════════════════ ENTRY POINT ═══════════════════════════
 
 def main():
-    logger = logging.getLogger("Main")
-    logger.info("Starting Code Typing Video Generator...")
+    ensure_cwd_dirs()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(30, 30, 30)); pal.setColor(QPalette.WindowText, QColor(200, 200, 200))
-    pal.setColor(QPalette.Base, QColor(25, 25, 25)); pal.setColor(QPalette.AlternateBase, QColor(35, 35, 35))
-    pal.setColor(QPalette.ToolTipBase, QColor(25, 25, 25)); pal.setColor(QPalette.ToolTipText, QColor(200, 200, 200))
-    pal.setColor(QPalette.Text, QColor(200, 200, 200)); pal.setColor(QPalette.Button, QColor(45, 45, 45))
-    pal.setColor(QPalette.ButtonText, QColor(200, 200, 200)); pal.setColor(QPalette.Link, QColor(42, 130, 218))
-    pal.setColor(QPalette.Highlight, QColor(42, 130, 218)); pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    app.setPalette(pal)
+    # Dark palette
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor("#1e1e2e"))
+    palette.setColor(QPalette.WindowText, QColor("#cdd6f4"))
+    palette.setColor(QPalette.Base, QColor("#181825"))
+    palette.setColor(QPalette.AlternateBase, QColor("#1e1e2e"))
+    palette.setColor(QPalette.ToolTipBase, QColor("#1e1e2e"))
+    palette.setColor(QPalette.ToolTipText, QColor("#cdd6f4"))
+    palette.setColor(QPalette.Text, QColor("#cdd6f4"))
+    palette.setColor(QPalette.Button, QColor("#313244"))
+    palette.setColor(QPalette.ButtonText, QColor("#cdd6f4"))
+    palette.setColor(QPalette.BrightText, QColor("#f38ba8"))
+    palette.setColor(QPalette.Highlight, QColor("#89b4fa"))
+    palette.setColor(QPalette.HighlightedText, QColor("#1e1e2e"))
+    app.setPalette(palette)
 
-    win = MainWindow()
-    win.show()
-    logger.info("Main window shown. Entering event loop.")
+    window = MainWindow()
+    window.show()
+    logging.getLogger("Main").info("Main window shown. Entering event loop.")
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
