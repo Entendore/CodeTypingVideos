@@ -1949,13 +1949,30 @@ class LayoutPreviewDialog(QDialog):
 
     def _render_current(self):
         import time
+        import bisect
         t0 = time.perf_counter()
         total_chars = len(self.animator.display_chars)
         num_vis = int(total_chars * self._current_progress)
         nv = self.animator.visible_at(self.animator.duration() * self._current_progress)
+
+        # Determine active key for keyboard overlay animation
+        active_char = None
+        key_flash = 0.0
+        anim_t = self.animator.duration() * self._current_progress
+        if nv > 0 and self.renderer.keyboard_overlay:
+            idx = bisect.bisect_right(self.animator._timestamps, anim_t)
+            if idx > 0:
+                active_char = self.animator.timeline[idx - 1][2]
+                dt = anim_t - self.animator.timeline[idx - 1][0]
+                if dt < 0.18:
+                    key_flash = max(0.0, 1.0 - dt / 0.18)
+                else:
+                    active_char = None
+
         scratch = QImage(self.renderer.width, self.renderer.height, QImage.Format_RGB32)
         qimg = self.renderer.render_frame(
             self.animator.display_chars, nv, cursor_visible=True, target=scratch,
+            active_char=active_char, key_flash=key_flash,
         )
         elapsed = time.perf_counter() - t0
         self.preview_label.set_preview_image(qimg)
@@ -2407,13 +2424,20 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        # --- File list group ---
-        file_group = QGroupBox("Programs (check to export)")
+        # ── Horizontal split: LEFT (programs) | RIGHT (settings) ──
+        hsplit = QHBoxLayout()
+        hsplit.setSpacing(16)
+
+        # ======== LEFT PANEL: Programs ========
+        left_panel = QVBoxLayout()
+        left_panel.setContentsMargins(0, 0, 0, 0)
+
+        file_group = QGroupBox("Programs")
         fg_lay = QVBoxLayout(file_group)
 
         # Buttons row 1: scan controls
         btn_row = QHBoxLayout()
-        self.scan_btn = QPushButton("Scan input/ folder")
+        self.scan_btn = QPushButton("Scan input/")
         self.scan_btn.clicked.connect(self._scan_input_dir)
         btn_row.addWidget(self.scan_btn)
 
@@ -2474,134 +2498,160 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.itemChanged.connect(self._on_item_changed)
         fg_lay.addWidget(self.table)
-        root.addWidget(file_group, stretch=1)
+        left_panel.addWidget(file_group, stretch=1)
 
-        # --- Settings group ---
-        settings_group = QGroupBox("Settings")
-        sg = QGridLayout(settings_group)
-        sg.setSpacing(8)
-        row = 0
+        # --- Progress (under left panel) ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        left_panel.addWidget(self.progress_bar)
 
-        sg.addWidget(QLabel("Theme:"), row, 0)
+        # --- Export / Cancel buttons ---
+        btn_row3 = QHBoxLayout()
+        btn_row3.addStretch()
+        self.export_btn = QPushButton("Export Checked")
+        self.export_btn.setObjectName("primaryBtn")
+        self.export_btn.setMinimumHeight(36)
+        self.export_btn.clicked.connect(self._start_export)
+        btn_row3.addWidget(self.export_btn)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_export)
+        btn_row3.addWidget(self.cancel_btn)
+        left_panel.addLayout(btn_row3)
+
+        hsplit.addLayout(left_panel, stretch=3)
+
+        # ======== RIGHT PANEL: Settings (tabbed) ========
+        right_panel = QVBoxLayout()
+        right_panel.setContentsMargins(0, 0, 0, 0)
+
+        settings_tabs = QTabWidget()
+        settings_tabs.setObjectName("settingsTabs")
+
+        # ── Tab 1: General ──
+        general_tab = QWidget()
+        sg = QFormLayout(general_tab)
+        sg.setSpacing(10)
+        sg.setContentsMargins(12, 16, 12, 12)
+
         self.theme_cb = QComboBox()
         self.theme_cb.addItems(list(THEMES.keys()))
         self.theme_cb.setCurrentText("Dracula")
-        sg.addWidget(self.theme_cb, row, 1)
+        sg.addRow("Theme:", self.theme_cb)
 
-        sg.addWidget(QLabel("Resolution:"), row, 2)
         self.res_cb = QComboBox()
         self.res_cb.addItems(list(RESOLUTIONS.keys()))
         self.res_cb.setCurrentText("1920x1080")
-        sg.addWidget(self.res_cb, row, 3)
+        sg.addRow("Resolution:", self.res_cb)
 
-        row += 1
-        sg.addWidget(QLabel("WPM:"), row, 0)
         self.wpm_sp = QSpinBox()
         self.wpm_sp.setRange(30, 300)
         self.wpm_sp.setValue(100)
-        sg.addWidget(self.wpm_sp, row, 1)
+        sg.addRow("WPM:", self.wpm_sp)
 
-        sg.addWidget(QLabel("FPS:"), row, 2)
         self.fps_sp = QSpinBox()
         self.fps_sp.setRange(10, 60)
         self.fps_sp.setValue(30)
-        sg.addWidget(self.fps_sp, row, 3)
+        sg.addRow("FPS:", self.fps_sp)
 
-        row += 1
-        sg.addWidget(QLabel("Start Pause (s):"), row, 0)
         self.start_pause_sp = QDoubleSpinBox()
         self.start_pause_sp.setRange(0, 10)
         self.start_pause_sp.setSingleStep(0.5)
         self.start_pause_sp.setValue(0.5)
-        sg.addWidget(self.start_pause_sp, row, 1)
+        sg.addRow("Start Pause (s):", self.start_pause_sp)
 
-        sg.addWidget(QLabel("End Pause (s):"), row, 2)
         self.end_pause_sp = QDoubleSpinBox()
         self.end_pause_sp.setRange(0, 10)
         self.end_pause_sp.setSingleStep(0.5)
         self.end_pause_sp.setValue(1.5)
-        sg.addWidget(self.end_pause_sp, row, 3)
+        sg.addRow("End Pause (s):", self.end_pause_sp)
 
-        row += 1
+        # Font size override
+        font_size_row = QHBoxLayout()
+        self.font_size_auto_chk = QCheckBox("Auto")
+        self.font_size_auto_chk.setChecked(True)
+        self.font_size_auto_chk.setToolTip("Automatically calculate font size to fit code")
+        font_size_row.addWidget(self.font_size_auto_chk)
+        self.font_size_sp = QSpinBox()
+        self.font_size_sp.setRange(8, 72)
+        self.font_size_sp.setValue(22)
+        self.font_size_sp.setSuffix(" px")
+        self.font_size_sp.setEnabled(False)
+        self.font_size_sp.setToolTip("Manual font size override")
+        font_size_row.addWidget(self.font_size_sp)
+        self.font_size_auto_chk.toggled.connect(self._on_font_size_auto_toggled)
+        sg.addRow("Code Font Size:", font_size_row)
+
+        settings_tabs.addTab(general_tab, "General")
+
+        # ── Tab 2: Audio ──
+        audio_tab = QWidget()
+        al = QFormLayout(audio_tab)
+        al.setSpacing(10)
+        al.setContentsMargins(12, 16, 12, 12)
+
         self.sound_chk = QCheckBox("Typing Sounds")
         self.sound_chk.setChecked(True)
         self.sound_chk.toggled.connect(self._on_sound_toggled)
-        sg.addWidget(self.sound_chk, row, 0, 1, 2)
+        al.addRow(self.sound_chk)
 
-        sg.addWidget(QLabel("Volume:"), row, 2)
         self.vol_sl = QSpinBox()
         self.vol_sl.setRange(0, 100)
         self.vol_sl.setValue(50)
         self.vol_sl.setSuffix("%")
-        sg.addWidget(self.vol_sl, row, 3)
+        al.addRow("Volume:", self.vol_sl)
 
-        row += 1
-        sg.addWidget(QLabel("Sound Preset:"), row, 0)
         self.sound_preset_cb = QComboBox()
         self.sound_preset_cb.addItems(list(SOUND_PRESETS.keys()))
         self.sound_preset_cb.setCurrentText("Mechanical")
         self.sound_preset_cb.currentTextChanged.connect(self._on_preset_changed)
-        sg.addWidget(self.sound_preset_cb, row, 1)
+        al.addRow("Sound Preset:", self.sound_preset_cb)
 
         self.preset_desc_lbl = QLabel(SOUND_PRESETS["Mechanical"]["description"])
         self.preset_desc_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; font-style: italic;")
-        sg.addWidget(self.preset_desc_lbl, row, 2, 1, 1)
+        al.addRow(self.preset_desc_lbl)
 
         self.preview_btn = QPushButton("\u25b6 Preview Sound")
         self.preview_btn.setObjectName("previewBtn")
         self.preview_btn.clicked.connect(self._preview_sound)
-        sg.addWidget(self.preview_btn, row, 3)
+        al.addRow(self.preview_btn)
 
-        row += 1
-        self.kb_overlay_chk = QCheckBox("Keyboard Overlay")
+        settings_tabs.addTab(audio_tab, "Audio")
+
+        # ── Tab 3: Keyboard ──
+        kb_tab = QWidget()
+        kl = QFormLayout(kb_tab)
+        kl.setSpacing(10)
+        kl.setContentsMargins(12, 16, 12, 12)
+
+        self.kb_overlay_chk = QCheckBox("Show Keyboard Overlay")
         self.kb_overlay_chk.setChecked(False)
         self.kb_overlay_chk.toggled.connect(self._on_kb_overlay_toggled)
-        sg.addWidget(self.kb_overlay_chk, row, 0, 1, 1)
+        kl.addRow(self.kb_overlay_chk)
 
-        sg.addWidget(QLabel("Layout:"), row, 1)
         self.kb_layout_cb = QComboBox()
         self.kb_layout_cb.addItems(list(KEYBOARD_LAYOUTS.keys()))
         self.kb_layout_cb.setCurrentText("QWERTY")
         self.kb_layout_cb.setEnabled(False)
         self.kb_layout_cb.currentTextChanged.connect(self._on_kb_layout_changed)
-        sg.addWidget(self.kb_layout_cb, row, 2)
+        kl.addRow("Layout:", self.kb_layout_cb)
 
         self.kb_desc_lbl = QLabel(KEYBOARD_LAYOUTS["QWERTY"]["description"])
         self.kb_desc_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; font-style: italic;")
         self.kb_desc_lbl.setEnabled(False)
-        sg.addWidget(self.kb_desc_lbl, row, 3)
+        kl.addRow(self.kb_desc_lbl)
 
-        row += 1
-        self.preview_layout_btn = QPushButton("🖼  Preview Layout")
+        self.preview_layout_btn = QPushButton("Preview Layout")
         self.preview_layout_btn.setObjectName("previewBtn")
         self.preview_layout_btn.clicked.connect(self._preview_layout)
-        sg.addWidget(self.preview_layout_btn, row, 0, 1, 2)
+        kl.addRow(self.preview_layout_btn)
 
-        root.addWidget(settings_group)
+        settings_tabs.addTab(kb_tab, "Keyboard")
 
-        # --- Progress ---
-        prog_row = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        prog_row.addWidget(self.progress_bar)
-        root.addLayout(prog_row)
+        right_panel.addWidget(settings_tabs)
+        hsplit.addLayout(right_panel, stretch=2)
 
-        # --- Buttons ---
-        btn_row2 = QHBoxLayout()
-        btn_row2.addStretch()
-
-        self.export_btn = QPushButton("Export Checked")
-        self.export_btn.setObjectName("primaryBtn")
-        self.export_btn.setMinimumHeight(36)
-        self.export_btn.clicked.connect(self._start_export)
-        btn_row2.addWidget(self.export_btn)
-
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self._cancel_export)
-        btn_row2.addWidget(self.cancel_btn)
-
-        root.addLayout(btn_row2)
+        root.addLayout(hsplit, stretch=1)
 
         # --- Status bar ---
         self.statusBar().showMessage("Ready. Place code files in input/ folder and click Scan.")
@@ -2632,6 +2682,11 @@ class MainWindow(QMainWindow):
         """Update the keyboard layout description label."""
         desc = KEYBOARD_LAYOUTS.get(layout_name, {}).get("description", "")
         self.kb_desc_lbl.setText(desc)
+
+    def _on_font_size_auto_toggled(self, checked: bool):
+        """Toggle between auto and manual font size."""
+        self.font_size_sp.setEnabled(not checked)
+
 
     def _preview_sound(self):
         """Open the professional audio preview dialog."""
@@ -2681,11 +2736,14 @@ class MainWindow(QMainWindow):
                 )
                 kb_h = kb_overlay.height_needed()
 
-            font_size = CodeRenderer.auto_font_size(
-                code_lines=code.count("\n") + 1,
-                width=w, height=h, code=code,
-                font_family="Consolas", keyboard_h=kb_h,
-            )
+            if self.font_size_auto_chk.isChecked():
+                font_size = CodeRenderer.auto_font_size(
+                    code_lines=code.count("\n") + 1,
+                    width=w, height=h, code=code,
+                    font_family="Consolas", keyboard_h=kb_h,
+                )
+            else:
+                font_size = self.font_size_sp.value()
 
             renderer = CodeRenderer(
                 width=w, height=h,
@@ -2719,6 +2777,8 @@ class MainWindow(QMainWindow):
         self.fps_sp.valueChanged.connect(self._auto_save_settings)
         self.start_pause_sp.valueChanged.connect(self._auto_save_settings)
         self.end_pause_sp.valueChanged.connect(self._auto_save_settings)
+        self.font_size_auto_chk.toggled.connect(self._auto_save_settings)
+        self.font_size_sp.valueChanged.connect(self._auto_save_settings)
         self.sound_chk.toggled.connect(self._auto_save_settings)
         self.vol_sl.valueChanged.connect(self._auto_save_settings)
         self.sound_preset_cb.currentTextChanged.connect(self._auto_save_settings)
@@ -2749,6 +2809,8 @@ class MainWindow(QMainWindow):
                 "fps": self.fps_sp.value(),
                 "start_pause": self.start_pause_sp.value(),
                 "end_pause": self.end_pause_sp.value(),
+                "font_size_auto": self.font_size_auto_chk.isChecked(),
+                "font_size": self.font_size_sp.value(),
                 "sound_enabled": self.sound_chk.isChecked(),
                 "volume": self.vol_sl.value(),
                 "sound_preset": self.sound_preset_cb.currentText(),
@@ -2798,6 +2860,10 @@ class MainWindow(QMainWindow):
                 self.kb_overlay_chk.setChecked(bool(data["kb_overlay"]))
             if "kb_layout" in data and data["kb_layout"] in KEYBOARD_LAYOUTS:
                 self.kb_layout_cb.setCurrentText(data["kb_layout"])
+            if "font_size_auto" in data:
+                self.font_size_auto_chk.setChecked(bool(data["font_size_auto"]))
+            if "font_size" in data:
+                self.font_size_sp.setValue(int(data["font_size"]))
             if "recursive" in data:
                 self.recurse_chk.setChecked(bool(data["recursive"]))
             if "depth" in data:
@@ -3004,12 +3070,15 @@ class MainWindow(QMainWindow):
         res_name = self.res_cb.currentText()
         w, h = RESOLUTIONS.get(res_name, (1920, 1080))
 
-        font_size = CodeRenderer.auto_font_size(
-            code_lines=code.count("\n") + 1,
-            width=w, height=h,
-            code=code,
-            font_family="Consolas",
-        )
+        if self.font_size_auto_chk.isChecked():
+            font_size = CodeRenderer.auto_font_size(
+                code_lines=code.count("\n") + 1,
+                width=w, height=h,
+                code=code,
+                font_family="Consolas",
+            )
+        else:
+            font_size = self.font_size_sp.value()
 
         title = f"{os.path.basename(item.path)} - Code Editor"
 
@@ -3025,13 +3094,14 @@ class MainWindow(QMainWindow):
             )
             kb_h = kb_overlay.height_needed()
             # Recalculate font size with keyboard space reserved
-            font_size = CodeRenderer.auto_font_size(
-                code_lines=code.count("\n") + 1,
-                width=w, height=h,
-                code=code,
-                font_family="Consolas",
-                keyboard_h=kb_h,
-            )
+            if self.font_size_auto_chk.isChecked():
+                font_size = CodeRenderer.auto_font_size(
+                    code_lines=code.count("\n") + 1,
+                    width=w, height=h,
+                    code=code,
+                    font_family="Consolas",
+                    keyboard_h=kb_h,
+                )
 
         renderer = CodeRenderer(
             width=w, height=h,
@@ -3150,6 +3220,22 @@ QProgressBar {
     text-align: center; color: #cdd6f4; min-height: 20px;
 }
 QProgressBar::chunk { background: #89b4fa; border-radius: 4px; }
+QTabWidget::pane {
+    border: 1px solid #45475a; border-radius: 6px;
+    background: #1e1e2e; top: -1px;
+}
+QTabBar::tab {
+    background: #313244; color: #a6adc8; padding: 8px 18px;
+    border: 1px solid #45475a; border-bottom: none;
+    border-top-left-radius: 6px; border-top-right-radius: 6px;
+    font-size: 12px; font-weight: bold; margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background: #1e1e2e; color: #cdd6f4; border-bottom: 2px solid #89b4fa;
+}
+QTabBar::tab:hover:!selected {
+    background: #45475a; color: #cdd6f4;
+}
 QStatusBar { color: #a6adc8; font-size: 12px; }
 """
 
