@@ -1,0 +1,8 @@
+[package]
+name = "rust_pointer_examples"
+version = "0.1.0"
+edition = "2021"
+
+# Uncomment the line below to run the c_void example (example 18)
+# [dependencies]
+# libc = "0.2"

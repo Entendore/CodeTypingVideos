@@ -39,4 +39,5 @@ dist/
 # >>> AUTO DISCOVERED RULES >>>
 output/
 tmp/
+*json
 # <<< AUTO DISCOVERED RULES <<<

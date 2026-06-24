@@ -1,0 +1,3179 @@
+"""
+Simple Code Typing Video Generator
+
+Scans a folder for code files, lets you pick them with checkboxes,
+then renders typing-animation MP4 videos (with procedural audio)
+via FFmpeg.
+
+Requirements:  Python 3.9+, PySide6, numpy, FFmpeg (on PATH).
+Usage:         python simple_code_typing.py
+"""
+
+from __future__ import annotations
+
+import bisect
+import json
+import logging
+import math
+import os
+import random
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time as _time
+import wave
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PySide6.QtCore import (
+    QEvent, QPoint, QRect, Qt, QThread, Signal, QTimer, QUrl,
+)
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPalette, QPen, QBrush, QPainterPath, QPixmap,
+)
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+    QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QSizePolicy, QSpinBox, QStatusBar, QStyleFactory, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QScrollArea,
+    QFormLayout, QFrame, QDialogButtonBox, QSlider, QGraphicsDropShadowEffect
+)
+
+# ── logging ──────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("SimpleCTVG")
+
+# ── directories ─────────────────────────────────────────────────────
+
+CWD = os.getcwd()
+INPUT_DIR  = os.path.join(CWD, "input")
+OUTPUT_DIR = os.path.join(CWD, "output")
+TMP_DIR    = os.path.join(CWD, "tmp")
+
+SETTINGS_FILE = os.path.join(CWD, "settings.json")
+
+for _d in (INPUT_DIR, OUTPUT_DIR, TMP_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+# ── supported extensions & language map ─────────────────────────────
+
+SUPPORTED_EXTENSIONS = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h",
+    ".hpp", ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt",
+    ".sh", ".bash", ".zsh", ".sql", ".html", ".css", ".scss", ".json",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".txt", ".md",
+    ".lua", ".dart", ".r", ".m",
+})
+
+EXT_TO_LANGUAGE: dict[str, str] = {
+    ".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript",
+    ".java": "CFamily", ".c": "CFamily", ".cpp": "CFamily",
+    ".h": "CFamily", ".hpp": "CFamily", ".cs": "CFamily",
+    ".go": "Go", ".rs": "Rust",
+}
+
+# ── resolution presets ──────────────────────────────────────────────
+
+RESOLUTIONS: Dict[str, Tuple[int, int]] = {
+    "1920x1080": (1920, 1080),
+    "1280x720":  (1280, 720),
+    "3840x2160": (3840, 2160),
+    "1080x1920 (9:16)": (1080, 1920),
+}
+
+# ── colour themes ───────────────────────────────────────────────────
+
+THEMES: Dict[str, Dict[str, str]] = {
+    "Dracula": {
+        "background": "#282a36", "foreground": "#f8f8f2",
+        "comment": "#6272a4", "keyword": "#ff79c6", "string": "#f1fa8c",
+        "number": "#bd93f9", "function": "#50fa7b", "builtin": "#8be9fd",
+        "decorator": "#50fa7b", "operator": "#ff79c6", "class_name": "#8be9fd",
+        "line_number": "#6272a4", "current_line": "#44475a", "cursor": "#f8f8f2",
+        "title_bar": "#21222c", "title_text": "#8be9fd",
+        "window_border": "#191a21",
+    },
+    "One Dark": {
+        "background": "#282c34", "foreground": "#abb2bf",
+        "comment": "#5c6370", "keyword": "#c678dd", "string": "#98c379",
+        "number": "#d19a66", "function": "#61afef", "builtin": "#e5c07b",
+        "decorator": "#56b6c2", "operator": "#c678dd", "class_name": "#e5c07b",
+        "line_number": "#4b5263", "current_line": "#2c313c", "cursor": "#528bff",
+        "title_bar": "#21252b", "title_text": "#61afef",
+        "window_border": "#181a1f",
+    },
+    "GitHub Dark": {
+        "background": "#0d1117", "foreground": "#c9d1d9",
+        "comment": "#8b949e", "keyword": "#ff7b72", "string": "#a5d6ff",
+        "number": "#79c0ff", "function": "#d2a8ff", "builtin": "#ffa657",
+        "decorator": "#ffa657", "operator": "#ff7b72", "class_name": "#ffa657",
+        "line_number": "#484f58", "current_line": "#161b22", "cursor": "#58a6ff",
+        "title_bar": "#010409", "title_text": "#58a6ff",
+        "window_border": "#010409",
+    },
+    "Monokai": {
+        "background": "#272822", "foreground": "#f8f8f2",
+        "comment": "#75715e", "keyword": "#f92672", "string": "#e6db74",
+        "number": "#ae81ff", "function": "#a6e22e", "builtin": "#66d9ef",
+        "decorator": "#a6e22e", "operator": "#f92672", "class_name": "#66d9ef",
+        "line_number": "#75715e", "current_line": "#3e3d32", "cursor": "#f8f8f2",
+        "title_bar": "#1e1f1c", "title_text": "#a6e22e",
+        "window_border": "#1e1f1c",
+    },
+    "Solarized Dark": {
+        "background": "#002b36", "foreground": "#839496",
+        "comment": "#586e75", "keyword": "#859900", "string": "#2aa198",
+        "number": "#d33682", "function": "#268bd2", "builtin": "#b58900",
+        "decorator": "#b58900", "operator": "#859900", "class_name": "#b58900",
+        "line_number": "#586e75", "current_line": "#073642", "cursor": "#93a1a1",
+        "title_bar": "#073642", "title_text": "#268bd2",
+        "window_border": "#001e26",
+    },
+    "VS Code Dark+": {
+        "background": "#1e1e1e", "foreground": "#d4d4d4",
+        "comment": "#6a9955", "keyword": "#569cd6", "string": "#ce9178",
+        "number": "#b5cea8", "function": "#dcdcaa", "builtin": "#4ec9b0",
+        "decorator": "#4ec9b0", "operator": "#d4d4d4", "class_name": "#4ec9b0",
+        "line_number": "#858585", "current_line": "#2a2d2e", "cursor": "#aeafad",
+        "title_bar": "#323233", "title_text": "#007acc",
+        "window_border": "#323233",
+    },
+}
+
+# ── language definitions (tokenizer data) ───────────────────────────
+
+_LANG_DATA: Dict[str, dict] = {
+    "Python": {
+        "keywords": {
+            "False", "None", "True", "and", "as", "assert", "async", "await",
+            "break", "class", "continue", "def", "del", "elif", "else",
+            "except", "finally", "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+            "return", "try", "while", "with", "yield",
+        },
+        "builtins": {
+            "print", "len", "range", "int", "str", "float", "list", "dict",
+            "set", "tuple", "bool", "type", "isinstance", "enumerate", "zip",
+            "map", "filter", "sorted", "reversed", "open", "super", "property",
+            "staticmethod", "classmethod", "abs", "max", "min", "sum", "any",
+            "all", "hash", "id", "input", "format", "hex", "oct", "bin",
+            "round", "pow", "divmod", "chr", "ord", "repr", "vars", "dir",
+            "getattr", "setattr", "hasattr", "delattr", "callable", "iter",
+            "next", "send", "throw", "close",
+        },
+        "extra_patterns": [
+            ("decorator", r"@\w+(\.\w+)*"),
+        ],
+        "comment": r"#[^\n]*",
+        "string":  r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'',
+        "number":  r"\b\d+\.?\d*(?:e[+-]?\d+)?\b|0x[0-9a-fA-F]+\b",
+    },
+    "JavaScript": {
+        "keywords": {
+            "break", "case", "catch", "class", "const", "continue", "debugger",
+            "default", "delete", "do", "else", "export", "extends", "finally",
+            "for", "function", "if", "import", "in", "instanceof", "let",
+            "new", "of", "return", "static", "super", "switch", "this",
+            "throw", "try", "typeof", "var", "void", "while", "with", "yield",
+            "async", "await", "from", "as", "true", "false", "null", "undefined",
+        },
+        "builtins": {
+            "console", "Math", "JSON", "Array", "Object", "String", "Number",
+            "Boolean", "Date", "RegExp", "Error", "Map", "Set", "Promise",
+            "Symbol", "Proxy", "Reflect", "parseInt", "parseFloat", "isNaN",
+            "isFinite", "encodeURI", "decodeURI", "setTimeout", "setInterval",
+            "clearTimeout", "clearInterval", "fetch", "document", "window",
+            "require", "module", "process", "Buffer", "global",
+        },
+        "extra_patterns": [],
+        "comment": r"//[^\n]*|/\*[\s\S]*?\*/",
+        "string":  r'`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'',
+        "number":  r"\b\d+\.?\d*(?:e[+-]?\d+)?\b|0x[0-9a-fA-F]+\b",
+    },
+    "TypeScript": "JavaScript",
+    "CFamily": {
+        "keywords": {
+            "auto", "break", "case", "char", "const", "continue", "default",
+            "do", "double", "else", "enum", "extern", "float", "for", "goto",
+            "if", "inline", "int", "long", "register", "return", "short",
+            "signed", "sizeof", "static", "struct", "switch", "typedef",
+            "union", "unsigned", "void", "volatile", "while", "class",
+            "namespace", "template", "typename", "public", "private",
+            "protected", "virtual", "override", "final", "new", "delete",
+            "try", "catch", "throw", "using", "true", "false", "nullptr",
+            "boolean", "byte", "extends", "implements", "import", "instanceof",
+            "interface", "native", "package", "super", "synchronized",
+            "this", "throws", "transient", "abstract", "assert",
+        },
+        "builtins": {
+            "printf", "scanf", "malloc", "free", "sizeof", "strlen",
+            "std", "cout", "cin", "endl", "string", "vector", "map", "set",
+            "println", "System", "Math",
+        },
+        "extra_patterns": [],
+        "comment": r"//[^\n]*|/\*[\s\S]*?\*/",
+        "string":  r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'',
+        "number":  r"\b\d+\.?\d*(?:e[+-]?\d+)?\b|0x[0-9a-fA-F]+\b",
+    },
+    "Go": {
+        "keywords": {
+            "break", "case", "chan", "const", "continue", "default", "defer",
+            "else", "fallthrough", "for", "func", "go", "goto", "if",
+            "import", "interface", "map", "package", "range", "return",
+            "select", "struct", "switch", "type", "var", "nil", "true",
+            "false", "iota",
+        },
+        "builtins": {
+            "fmt", "os", "io", "strings", "strconv", "math", "time",
+            "len", "cap", "make", "new", "append", "copy", "delete",
+            "panic", "recover", "print", "println",
+        },
+        "extra_patterns": [],
+        "comment": r"//[^\n]*|/\*[\s\S]*?\*/",
+        "string":  r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'|`[^`]*`',
+        "number":  r"\b\d+\.?\d*(?:e[+-]?\d+)?\b|0x[0-9a-fA-F]+\b",
+    },
+    "Rust": {
+        "keywords": {
+            "fn", "let", "mut", "const", "static", "if", "else", "for",
+            "while", "loop", "match", "return", "break", "continue", "in",
+            "as", "use", "mod", "pub", "struct", "enum", "trait", "impl",
+            "where", "self", "Self", "super", "crate", "extern", "ref",
+            "move", "async", "await", "dyn", "unsafe", "true", "false",
+        },
+        "builtins": {
+            "println", "print", "format", "vec", "String", "Vec", "Option",
+            "Result", "Box", "Rc", "Arc", "Some", "None", "Ok", "Err",
+            "HashMap", "BTreeMap", "HashSet",
+        },
+        "extra_patterns": [],
+        "comment": r"//[^\n]*|/\*[\s\S]*?\*/",
+        "string":  r'"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'',
+        "number":  r"\b\d+\.?\d*(?:e[+-]?\d+)?\b|0x[0-9a-fA-F]+\b",
+    },
+}
+
+# Resolve aliases
+for _k, _v in list(_LANG_DATA.items()):
+    if isinstance(_v, str) and _v in _LANG_DATA:
+        _LANG_DATA[_k] = _LANG_DATA[_v]
+
+
+# =====================================================================
+# Tokenizer
+# =====================================================================
+
+class Tokenizer:
+    """Lightweight regex tokenizer for syntax highlighting."""
+
+    _COMPILED: Dict[str, re.Pattern] = {}
+    _LOCK = threading.Lock()
+
+    @classmethod
+    def _compile(cls, lang: str) -> re.Pattern:
+        if lang not in cls._COMPILED:
+            with cls._LOCK:
+                if lang not in cls._COMPILED:
+                    data = _LANG_DATA.get(lang, _LANG_DATA["Python"])
+                    patterns = list(data.get("extra_patterns", []))
+                    patterns.extend([
+                        ("comment",    data["comment"]),
+                        ("string",     data["string"]),
+                        ("number",     data["number"]),
+                        ("keyword",    r"\b(?:" + "|".join(data["keywords"]) + r")\b"),
+                        ("builtin",    r"\b(?:" + "|".join(data["builtins"]) + r")\b"),
+                        ("function",   r"\b([a-zA-Z_]\w*)\s*(?=\()"),
+                        ("identifier", r"\b[a-zA-Z_]\w*\b"),
+                        ("operator",   r"[+\-*/%=<>!&|^~]+"),
+                        ("bracket",    r"[(){}[\]]"),
+                        ("punctuation",r"[;:,.]"),
+                        ("whitespace", r"\s+"),
+                        ("other",      r"."),
+                    ])
+                    pat_str = "|".join(f"(?P<{n}>{p})" for n, p in patterns)
+                    cls._COMPILED[lang] = re.compile(pat_str, re.MULTILINE | re.DOTALL)
+        return cls._COMPILED[lang]
+
+    @classmethod
+    def tokenize(cls, text: str, lang: str) -> List[Tuple[str, str]]:
+        compiled = cls._COMPILED.get(lang) or cls._compile(lang)
+        return [(m.lastgroup, m.group()) for m in compiled.finditer(text)]
+
+
+# =====================================================================
+# Sound Presets
+# =====================================================================
+
+SOUND_PRESETS = {
+    "Mechanical": {
+        "description": "Standard mechanical keyboard click",
+    },
+    "Typewriter": {
+        "description": "Classic typewriter with carriage bell on Enter",
+    },
+    "Cash Register": {
+        "description": "Chunky cash register keys with ka-ching on Enter",
+    },
+}
+
+
+# ── Mechanical preset (original sounds) ────────────────────────────
+
+def _make_mechanical_click(sr: int = 44100, duration: float = 0.06, seed: int = 0) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+    n = int(sr * duration)
+    t = np.linspace(0, duration, n, False)
+    noise = rng.randn(n) * np.exp(-t * 500) * 0.4
+    freq = 3500 + rng.randint(-300, 300)
+    click = np.sin(2 * np.pi * freq * t) * np.exp(-t * 400) * 0.5
+    thud = np.sin(2 * np.pi * 200 * t) * np.exp(-t * 150) * 0.3
+    out = noise + click + thud
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.7
+    return out.astype(np.int16)
+
+
+def _make_mechanical_space(sr: int = 44100, seed: int = 100) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+    n = int(sr * 0.09)
+    t = np.linspace(0, 0.09, n, False)
+    noise = rng.randn(n) * np.exp(-t * 250) * 0.35
+    thud = np.sin(2 * np.pi * 140 * t) * np.exp(-t * 120) * 0.5
+    out = noise + thud
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.7
+    return out.astype(np.int16)
+
+
+def _make_mechanical_enter(sr: int = 44100, seed: int = 200) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+    n = int(sr * 0.08)
+    t = np.linspace(0, 0.08, n, False)
+    noise = rng.randn(n) * np.exp(-t * 300) * 0.4
+    thud = np.sin(2 * np.pi * 120 * t) * np.exp(-t * 130) * 0.55
+    out = noise + thud
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.7
+    return out.astype(np.int16)
+
+
+# ── Typewriter preset ──────────────────────────────────────────────
+
+def _make_typewriter_click(sr: int = 44100, duration: float = 0.045, seed: int = 0) -> np.ndarray:
+    """Sharp, metallic typewriter key strike - short and punchy."""
+    rng = np.random.RandomState(seed)
+    n = int(sr * duration)
+    t = np.linspace(0, duration, n, False)
+    # Sharp metal impact noise
+    noise = rng.randn(n) * np.exp(-t * 800) * 0.5
+    # High metallic ring
+    freq = 4500 + rng.randint(-400, 400)
+    ring = np.sin(2 * np.pi * freq * t) * np.exp(-t * 600) * 0.45
+    # Hammer arm thud
+    thud = np.sin(2 * np.pi * 280 * t) * np.exp(-t * 200) * 0.25
+    # Typebar slap
+    slap = np.sin(2 * np.pi * 1200 * t) * np.exp(-t * 900) * 0.3
+    out = noise + ring + thud + slap
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.75
+    return out.astype(np.int16)
+
+
+def _make_typewriter_space(sr: int = 44100, seed: int = 100) -> np.ndarray:
+    """Typewriter space bar - wider, more resonant."""
+    rng = np.random.RandomState(seed)
+    n = int(sr * 0.08)
+    t = np.linspace(0, 0.08, n, False)
+    noise = rng.randn(n) * np.exp(-t * 400) * 0.45
+    thud = np.sin(2 * np.pi * 180 * t) * np.exp(-t * 160) * 0.45
+    ring = np.sin(2 * np.pi * 2000 * t) * np.exp(-t * 500) * 0.2
+    out = noise + thud + ring
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.75
+    return out.astype(np.int16)
+
+
+def _make_typewriter_enter(sr: int = 44100, seed: int = 200) -> np.ndarray:
+    """Carriage return slide + bell - the classic typewriter ding."""
+    rng = np.random.RandomState(seed)
+    # Carriage return slide (0.25s)
+    slide_dur = 0.25
+    n_slide = int(sr * slide_dur)
+    t_s = np.linspace(0, slide_dur, n_slide, False)
+    # Sliding carriage noise
+    slide_noise = rng.randn(n_slide) * np.exp(-t_s * 20) * 0.15
+    # Ratchet sound (rapid clicks)
+    ratchet = np.sin(2 * np.pi * 60 * t_s * (1 + 8 * np.exp(-t_s * 15))) \
+        * np.exp(-t_s * 12) * 0.25
+    # Bell at the end (pure tone ding)
+    bell_dur = 0.35
+    n_bell = int(sr * bell_dur)
+    t_b = np.linspace(0, bell_dur, n_bell, False)
+    bell = np.sin(2 * np.pi * 2200 * t_b) * np.exp(-t_b * 8) * 0.5
+    bell += np.sin(2 * np.pi * 4400 * t_b) * np.exp(-t_b * 12) * 0.15
+    # Combine: slide first, then bell overlaps
+    out_len = n_slide + n_bell
+    out = np.zeros(out_len, dtype=np.float64)
+    out[:n_slide] += slide_noise + ratchet
+    overlap = int(sr * 0.05)
+    out[n_slide - overlap:n_slide - overlap + n_bell] += bell
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.75
+    return out.astype(np.int16)
+
+
+# ── Cash Register preset ───────────────────────────────────────────
+
+def _make_cashreg_click(sr: int = 44100, duration: float = 0.07, seed: int = 0) -> np.ndarray:
+    """Chunky, deep cash register key press."""
+    rng = np.random.RandomState(seed)
+    n = int(sr * duration)
+    t = np.linspace(0, duration, n, False)
+    # Heavy mechanical thud
+    thud = np.sin(2 * np.pi * 120 * t) * np.exp(-t * 100) * 0.6
+    # Key plunger noise
+    noise = rng.randn(n) * np.exp(-t * 350) * 0.35
+    # Plastic/metal clack
+    clack = np.sin(2 * np.pi * 2800 * t) * np.exp(-t * 500) * 0.3
+    # Spring return
+    spring = np.sin(2 * np.pi * 600 * t * (1 + 2 * np.exp(-t * 300))) \
+        * np.exp(-t * 250) * 0.15
+    out = thud + noise + clack + spring
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.7
+    return out.astype(np.int16)
+
+
+def _make_cashreg_space(sr: int = 44100, seed: int = 100) -> np.ndarray:
+    """Wide cash register bar press - heavier thud."""
+    rng = np.random.RandomState(seed)
+    n = int(sr * 0.10)
+    t = np.linspace(0, 0.10, n, False)
+    thud = np.sin(2 * np.pi * 100 * t) * np.exp(-t * 80) * 0.65
+    noise = rng.randn(n) * np.exp(-t * 200) * 0.3
+    clack = np.sin(2 * np.pi * 2000 * t) * np.exp(-t * 350) * 0.25
+    out = thud + noise + clack
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.7
+    return out.astype(np.int16)
+
+
+def _make_cashreg_enter(sr: int = 44100, seed: int = 200) -> np.ndarray:
+    """Cash register total key - chunky press + ka-ching!"""
+    rng = np.random.RandomState(seed)
+    # Key press (0.06s)
+    press_dur = 0.06
+    n_press = int(sr * press_dur)
+    t_p = np.linspace(0, press_dur, n_press, False)
+    thud = np.sin(2 * np.pi * 100 * t_p) * np.exp(-t_p * 150) * 0.5
+    noise = rng.randn(n_press) * np.exp(-t_p * 500) * 0.3
+    press = thud + noise
+    # Ka-ching! (0.5s) - two metallic tones
+    ka_dur = 0.18
+    ching_dur = 0.40
+    pause_dur = 0.04
+    n_ka = int(sr * ka_dur)
+    n_pause = int(sr * pause_dur)
+    n_ching = int(sr * ching_dur)
+    t_ka = np.linspace(0, ka_dur, n_ka, False)
+    t_ch = np.linspace(0, ching_dur, n_ching, False)
+    # "Ka" - low metallic
+    ka = np.sin(2 * np.pi * 800 * t_ka) * np.exp(-t_ka * 20) * 0.55
+    ka += np.sin(2 * np.pi * 1600 * t_ka) * np.exp(-t_ka * 25) * 0.25
+    ka += rng.randn(n_ka) * np.exp(-t_ka * 40) * 0.1
+    # "Ching" - high bell-like
+    ching = np.sin(2 * np.pi * 3500 * t_ch) * np.exp(-t_ch * 6) * 0.45
+    ching += np.sin(2 * np.pi * 5250 * t_ch) * np.exp(-t_ch * 8) * 0.2
+    ching += np.sin(2 * np.pi * 7000 * t_ch) * np.exp(-t_ch * 12) * 0.1
+    # Combine
+    out_len = n_press + n_ka + n_pause + n_ching
+    out = np.zeros(out_len, dtype=np.float64)
+    out[:n_press] += press
+    offset = n_press
+    out[offset:offset + n_ka] += ka
+    offset += n_ka + n_pause
+    out[offset:offset + n_ching] += ching
+    peak = np.max(np.abs(out))
+    if peak > 0:
+        out = out / peak * 32767 * 0.75
+    return out.astype(np.int16)
+
+
+# ── Preset dispatch tables ─────────────────────────────────────────
+
+_PRESET_FACTORIES: Dict[str, Dict[str, callable]] = {
+    "Mechanical": {
+        "click": _make_mechanical_click,
+        "space": _make_mechanical_space,
+        "enter": _make_mechanical_enter,
+    },
+    "Typewriter": {
+        "click": _make_typewriter_click,
+        "space": _make_typewriter_space,
+        "enter": _make_typewriter_enter,
+    },
+    "Cash Register": {
+        "click": _make_cashreg_click,
+        "space": _make_cashreg_space,
+        "enter": _make_cashreg_enter,
+    },
+}
+
+
+# =====================================================================
+# Simple Sound Generator
+# =====================================================================
+
+class SimpleSoundGen:
+    """Generate and mix typing sounds with selectable presets."""
+
+    def __init__(self, sr: int = 44100, preset: str = "Mechanical"):
+        self.sr = sr
+        self.preset = preset
+        factories = _PRESET_FACTORIES.get(preset, _PRESET_FACTORIES["Mechanical"])
+        # Pre-generate a small pool of variants
+        click_dur = 0.045 if preset == "Typewriter" else 0.06
+        self.clicks = [factories["click"](
+            sr, duration=click_dur, seed=i
+        ) for i in range(6)]
+        self.spaces = [factories["space"](sr, seed=100 + i) for i in range(3)]
+        self.enters = [factories["enter"](sr, seed=200 + i) for i in range(3)]
+
+    def _pick(self, char: str) -> np.ndarray:
+        if char == "\n":
+            return random.choice(self.enters)
+        if char == " ":
+            return random.choice(self.spaces)
+        return random.choice(self.clicks)
+
+    def generate_track(
+        self,
+        timestamps: List[Tuple[float, str]],
+        filepath: str,
+        volume: float = 0.5,
+    ) -> None:
+        """Mix all keystrokes into a WAV file."""
+        if not timestamps:
+            return
+        sr = self.sr
+        total = max(ts for ts, _ in timestamps) + 0.3
+        n = int(sr * total)
+        mix = np.zeros(n, dtype=np.float64)
+
+        for ts, ch in timestamps:
+            snd = self._pick(ch).astype(np.float64)
+            s = int(ts * sr)
+            e = min(s + len(snd), n)
+            if s < n:
+                mix[s:e] += snd[:e - s] * volume
+
+        # Simple soft-clip
+        peak = np.max(np.abs(mix))
+        if peak > 0:
+            target = 32767 * 10 ** (-1.5 / 20)
+            mix = mix * (target / peak)
+
+        pcm = np.clip(mix, -32768, 32767).astype(np.int16)
+        with wave.open(filepath, "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(pcm.tobytes())
+
+
+
+# =====================================================================
+# Keyboard Overlay
+# =====================================================================
+
+_US_SHIFT_MAP: Dict[str, str] = {
+    "~": "`", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+    "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+    ":": ";", '"': "'", "<": ",", ">": ".", "?": "/",
+}
+
+_QWERTY_ROWS = [
+    [("`",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("-",1),("=",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("E",1),("R",1),("T",1),("Y",1),("U",1),("I",1),("O",1),("P",1),("[",1),("]",1),("\\",1.5)],
+    [("Caps",1.75),("A",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),(";",1),("'",1),("Enter",2.25)],
+    [("Shift",2.25),("Z",1),("X",1),("C",1),("V",1),("B",1),("N",1),("M",1),(",",1),(".",1),("/",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+_AZERTY_ROWS = [
+    [("²",1),("&",1),("é",1),('"',1),("'",1),("(",1),("-",1),("è",1),("_",1),("ç",1),("à",1),(")",1),("=",1),("Bksp",2)],
+    [("Tab",1.5),("A",1),("Z",1),("E",1),("R",1),("T",1),("Y",1),("U",1),("I",1),("O",1),("P",1),("^",1),("$",1),("*",1.5)],
+    [("Caps",1.75),("Q",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),("M",1),("ù",1),("Enter",2.25)],
+    [("Shift",2.25),("<",1),("W",1),("X",1),("C",1),("V",1),("B",1),("N",1),(",",1),(";",1),(":",1),("!",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+_QWERTZ_ROWS = [
+    [("^",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("ß",1),("´",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("E",1),("R",1),("T",1),("Z",1),("U",1),("I",1),("O",1),("P",1),("Ü",1),("Ö",1),("Ä",1),("#",1.5)],
+    [("Caps",1.75),("A",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),("Ö",1),("Ä",1),("€",1),("Enter",2.25)],
+    [("Shift",2.25),("<",1),("Y",1),("X",1),("C",1),("V",1),("B",1),("N",1),("M",1),(",",1),(".",1),("-",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("AltGr",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+_DVORAK_ROWS = [
+    [("`",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("[",1),("]",1),("Bksp",2)],
+    [("Tab",1.5),("'",1),(",",1),(".",1),("P",1),("Y",1),("F",1),("G",1),("C",1),("R",1),("L",1),("/",1),("=",1),("\\",1.5)],
+    [("Caps",1.75),("A",1),("O",1),("E",1),("U",1),("I",1),("D",1),("H",1),("T",1),("N",1),("S",1),("-",1),("Enter",2.25)],
+    [("Shift",2.25),(";",1),("Q",1),("J",1),("K",1),("X",1),("B",1),("M",1),("W",1),("V",1),("Z",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+_COLEMAK_ROWS = [
+    [("`",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("-",1),("=",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("F",1),("P",1),("G",1),("J",1),("L",1),("U",1),("Y",1),(";",1),("[",1),("]",1),("\\",1.5)],
+    [("Bksp",1.75),("A",1),("R",1),("S",1),("T",1),("D",1),("H",1),("N",1),("E",1),("I",1),("O",1),("'",1),("Enter",2.25)],
+    [("Shift",2.25),("Z",1),("X",1),("C",1),("V",1),("B",1),("K",1),("M",1),(",",1),(".",1),("/",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+# JIS (Japanese) — 109-key layout with extra keys and smaller space bar
+_JIS_ROWS = [
+    # Half-width mode labels (JIS keyboard physically used for both)
+    [("半",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("-",1),("^",1),("¥",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("E",1),("R",1),("T",1),("Y",1),("U",1),("I",1),("O",1),("P",1),("@",1),("[",1),("]",1),("\\",1.5)],
+    [("Caps",1.75),("A",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),(";",1),(":",1),("Enter",2.25)],
+    [("Shift",2.25),("Z",1),("X",1),("C",1),("V",1),("B",1),("N",1),("M",1),(",",1),(".",1),("/",1),("_",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("無",1),("",4.25),("変",1.25),("Alt",1.25),("Fn",1.25),("Ctrl",1.25)],
+]
+
+_JIS_SHIFT_MAP: Dict[str, str] = {
+    "~": "`", "!": "1", '"': "2", "#": "3", "$": "4", "%": "5",
+    "&": "6", "'": "7", "(": "8", ")": "9", "=": "0", "~": "`",
+    "|": "-", "+": "^", "`": "@", "{": "[", "}": "]",
+    ":": ";", "*": ":", "<": ",", ">": ".", "?": "/",
+    "_": "_",
+}
+
+# Chinese (Pinyin input) — Uses standard US QWERTY physical layout
+# The labels show pinyin input method mode markings
+_PINYIN_ROWS = [
+    [("`",1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("-",1),("=",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("E",1),("R",1),("T",1),("Y",1),("U",1),("I",1),("O",1),("P",1),("[",1),("]",1),("\\",1.5)],
+    [("中",1.75),("A",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),(";",1),("'",1),("Enter",2.25)],
+    [("Shift",2.25),("Z",1),("X",1),("C",1),("V",1),("B",1),("N",1),("M",1),(",",1),(".",1),("/",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+# Turkish Q — Based on QWERTY with Turkish-specific characters
+_TURKISH_Q_ROWS = [
+    [('"',1),("1",1),("2",1),("3",1),("4",1),("5",1),("6",1),("7",1),("8",1),("9",1),("0",1),("*",1),("-",1),("Bksp",2)],
+    [("Tab",1.5),("Q",1),("W",1),("E",1),("R",1),("T",1),("Y",1),("U",1),("I",1),("O",1),("P",1),("Ğ",1),("Ü",1),(";",1.5)],
+    [("Caps",1.75),("A",1),("S",1),("D",1),("F",1),("G",1),("H",1),("J",1),("K",1),("L",1),("Ş",1),("İ",1),("Enter",2.25)],
+    [("Shift",2.25),("<",1),("Z",1),("X",1),("C",1),("V",1),("B",1),("N",1),("M",1),("Ö",1),("Ç",1),(".",1),("Shift",2.75)],
+    [("Ctrl",1.25),("Win",1.25),("Alt",1.25),("",6.25),("Alt",1.25),("Fn",1.25),("Menu",1.25),("Ctrl",1.25)],
+]
+
+_TURKISH_SHIFT_MAP: Dict[str, str] = {
+    "é": '"', "!": "1", "'": "2", "^": "3", "+": "4", "%": "5",
+    "&": "6", "/": "7", "(": "8", ")": "9", "=": "0", "?": "*",
+    "_": "-", "\\": "-", ",": ";", "{": "Ğ", "}": "Ü",
+    ":": "Ş", "[": "İ", "]": "Enter",
+    "|": "<", ">": ".", "#": ".",
+}
+
+KEYBOARD_LAYOUTS: Dict[str, Dict] = {
+    "QWERTY":   {"description": "Standard US QWERTY layout",   "rows": _QWERTY_ROWS,   "shift_map": _US_SHIFT_MAP},
+    "AZERTY":   {"description": "French AZERTY layout",        "rows": _AZERTY_ROWS,   "shift_map": {}},
+    "QWERTZ":   {"description": "German QWERTZ layout",       "rows": _QWERTZ_ROWS,   "shift_map": {}},
+    "Dvorak":   {"description": "Dvorak ergonomic layout",     "rows": _DVORAK_ROWS,   "shift_map": _US_SHIFT_MAP},
+    "Colemak":  {"description": "Colemak ergonomic layout",    "rows": _COLEMAK_ROWS,  "shift_map": _US_SHIFT_MAP},
+    "JIS (Japanese)":  {"description": "Japanese JIS 109-key layout",      "rows": _JIS_ROWS,         "shift_map": _JIS_SHIFT_MAP},
+    "Pinyin (Chinese)":{"description": "Chinese Pinyin input layout",       "rows": _PINYIN_ROWS,      "shift_map": _US_SHIFT_MAP},
+    "Turkish Q":       {"description": "Turkish Q keyboard layout",         "rows": _TURKISH_Q_ROWS,   "shift_map": _TURKISH_SHIFT_MAP},
+}
+
+
+def _build_char_map(layout_name: str) -> Dict[str, Tuple[int, int]]:
+    """Build a char -> (row, col) mapping from a keyboard layout."""
+    ld = KEYBOARD_LAYOUTS[layout_name]
+    cm: Dict[str, Tuple[int, int]] = {}
+    rows = ld["rows"]
+    for ri, row in enumerate(rows):
+        for ci, (label, _w) in enumerate(row):
+            if len(label) == 1:
+                cm[label] = (ri, ci)
+                low = label.lower()
+                up  = label.upper()
+                cm[low] = (ri, ci)
+                cm[up]  = (ri, ci)
+    # Special keys
+    for ri, row in enumerate(rows):
+        for ci, (label, _w) in enumerate(row):
+            ll = label.lower()
+            if ll == "space" or (label == "" and _w >= 4):
+                cm[" "] = (ri, ci)
+            elif "enter" in ll:
+                cm["\n"] = (ri, ci)
+            elif "tab" in ll:
+                cm["\t"] = (ri, ci)
+            elif "bksp" in ll:
+                cm["\x08"] = (ri, ci)
+    # Shift-map: shifted symbol -> same physical key as base char
+    for shifted, base in ld.get("shift_map", {}).items():
+        if base in cm:
+            cm[shifted] = cm[base]
+    return cm
+
+
+class KeyboardOverlay:
+    """Draws a semi-transparent keyboard overlay at the bottom of a frame."""
+
+    def __init__(
+        self,
+        video_w: int,
+        video_h: int,
+        layout_name: str = "QWERTY",
+        theme: Optional[Dict[str, str]] = None,
+        opacity: float = 0.82,
+    ):
+        self.video_w = video_w
+        self.video_h = video_h
+        self.layout_name = layout_name
+        self.theme = theme
+        self.opacity = opacity
+        self.rows = KEYBOARD_LAYOUTS[layout_name]["rows"]
+        self.char_map = _build_char_map(layout_name)
+
+        # Key dimensions  (scale to video size)
+        self.key_unit = max(20, int(video_w * 0.028))
+        self.key_gap  = max(2, self.key_unit // 14)
+        self.key_h    = int(self.key_unit * 0.82)
+
+        # Widest row in units
+        self._max_units = max(sum(w for _, w in row) for row in self.rows)
+        self._max_keys  = max(len(row) for row in self.rows)
+
+        # Compute total keyboard pixel width from widest row
+        self._kb_width = int(
+            self._max_units * self.key_unit
+            + (self._max_keys - 1) * self.key_gap
+        )
+        self._kb_height = int(
+            len(self.rows) * self.key_h
+            + (len(self.rows) - 1) * self.key_gap
+        )
+
+        # Position: centered horizontally, flush to bottom
+        self._kb_x = (video_w - self._kb_width) // 2
+        self._kb_y = video_h - self._kb_height - max(8, video_h // 60)
+
+        # Pre-compute key rects
+        self.key_rects: Dict[Tuple[int, int], QRect] = {}
+        for ri, row in enumerate(self.rows):
+            x = self._kb_x
+            for ci, (_label, w) in enumerate(row):
+                kw = int(w * self.key_unit) - self.key_gap
+                y = self._kb_y + ri * (self.key_h + self.key_gap)
+                self.key_rects[(ri, ci)] = QRect(x, y, kw, self.key_h)
+                x += int(w * self.key_unit)
+
+    # ---- public helpers ------------------------------------------------
+
+    def height_needed(self) -> int:
+        """Pixel height consumed by the overlay (for shrinking code area)."""
+        return self._kb_height + max(8, self.video_h // 60) + max(6, self.video_h // 90)
+
+    def resolve_key(self, ch: str) -> Optional[Tuple[int, int]]:
+        return self.char_map.get(ch)
+
+    # ---- drawing -------------------------------------------------------
+
+    def draw(self, painter: QPainter, active_key: Optional[Tuple[int, int]] = None,
+             flash: float = 0.0):
+        """Draw the full keyboard overlay. *flash* is 0-1 intensity for the highlight."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        th = self.theme or THEMES["Dracula"]
+        radius = max(3, self.key_unit // 8)
+
+        # Semi-transparent background behind the keyboard
+        bg = QColor(th["background"])
+        bg.setAlpha(int(230 * self.opacity))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        pad = max(6, self.key_unit // 4)
+        painter.drawRoundedRect(
+            self._kb_x - pad, self._kb_y - pad,
+            self._kb_width + 2 * pad, self._kb_height + 2 * pad,
+            radius * 2, radius * 2,
+        )
+
+        key_bg    = QColor(th["title_bar"])
+        key_bg.setAlpha(int(200 * self.opacity))
+        key_border = QColor(th["window_border"])
+        key_border.setAlpha(int(160 * self.opacity))
+        label_color = QColor(th["foreground"])
+        label_color.setAlpha(int(200 * self.opacity))
+        mod_color   = QColor(th["line_number"])
+        mod_color.setAlpha(int(180 * self.opacity))
+
+        # Highlight colour (use cursor colour from theme)
+        try:
+            hl_base = QColor(th["cursor"])
+        except Exception:
+            hl_base = QColor("#89b4fa")
+
+        for (ri, ci), rect in self.key_rects.items():
+            label = self.rows[ri][ci][0]
+            is_active = (active_key is not None and active_key == (ri, ci))
+
+            # --- key background ---
+            if is_active and flash > 0:
+                # Blend key_bg toward highlight based on flash
+                r_ = int(key_bg.red()   + (hl_base.red()   - key_bg.red())   * flash)
+                g_ = int(key_bg.green() + (hl_base.green() - key_bg.green()) * flash)
+                b_ = int(key_bg.blue()  + (hl_base.blue()  - key_bg.blue())  * flash)
+                fill = QColor(r_, g_, b_, int(255 * self.opacity))
+                painter.setBrush(fill)
+
+                # Glow behind the key
+                glow = QColor(hl_base)
+                glow.setAlpha(int(60 * flash * self.opacity))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(glow)
+                expand = max(3, int(self.key_unit * 0.12 * flash))
+                painter.drawRoundedRect(
+                    rect.adjusted(-expand, -expand, expand, expand),
+                    radius, radius,
+                )
+                # Reset to the highlighted fill
+                painter.setBrush(fill)
+            else:
+                painter.setBrush(key_bg)
+
+            painter.setPen(key_border)
+            painter.drawRoundedRect(rect, radius, radius)
+
+            # --- label ---
+            if label:
+                is_mod = len(label) > 1 or label in {
+                    "²", "^", "¨", "´", "ß", "Ü", "Ö", "Ä", "€", "ù",
+                    "é", "è", "ç", "à", "æ", "Ğ", "Ş", "İ", "Ö", "Ç",
+                    "¥", "@", "_", ":", "*", ";", "<", ">",
+                    "半", "無", "変", "中",
+                }
+                painter.setPen(mod_color if is_mod else label_color)
+                fsize = max(7, int(self.key_unit * 0.30))
+                painter.setFont(QFont("Segoe UI", fsize))
+                if label == "":
+                    pass
+                else:
+                    painter.drawText(rect, Qt.AlignCenter, label)
+
+        painter.restore()
+
+
+# =====================================================================
+# Typing Animator (simplified)
+# =====================================================================
+
+Event = Tuple[float, int, str]  # (timestamp, display_index, char)
+
+_QWERTY_ROWS = (
+    "`1234567890-=",
+    "qwertyuiop[]\\",
+    "asdfghjkl;'",
+    "zxcvbnm,./",
+)
+_QWERTY_POS: Dict[str, Tuple[int, int]] = {}
+for _r, _row in enumerate(_QWERTY_ROWS):
+    for _c, _ch in enumerate(_row):
+        _QWERTY_POS[_ch] = (_r, _c)
+for _ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    _QWERTY_POS[_ch] = _QWERTY_POS.get(_ch.lower(), (2, 0))
+
+
+class TypingAnimator:
+    """Build a per-character typing timeline with basic humanisation."""
+
+    def __init__(
+        self,
+        code: str,
+        wpm: int = 100,
+        start_pause: float = 0.5,
+        end_pause: float = 1.5,
+        seed: Optional[int] = None,
+    ):
+        self.code = code
+        self.start_pause = start_pause
+        self.end_pause = end_pause
+        cps = (wpm * 5) / 60
+        self.base_delay = 1.0 / cps
+        self.display_chars: List[str] = []
+        self.timeline: List[Event] = self._build(seed)
+        self._timestamps = [ts for ts, _, _ in self.timeline]
+
+    def _build(self, seed) -> List[Event]:
+        rng = random.Random(seed)
+        t = 0.0
+        events: List[Event] = []
+
+        for i, ch in enumerate(self.code):
+            # Basic per-char delay with jitter
+            d = self.base_delay * rng.uniform(0.6, 1.4)
+
+            # Char-class multipliers
+            if ch == "\n":
+                d *= rng.uniform(2.0, 4.0)
+            elif ch == " ":
+                d *= rng.uniform(0.7, 1.3)
+            elif ch == "\t":
+                d *= rng.uniform(1.2, 1.8)
+            elif ch in "([{" :
+                d *= rng.uniform(1.1, 1.8)
+            elif ch in ")]}":
+                d *= rng.uniform(0.9, 1.5)
+            elif ch in ",;:":
+                d *= rng.uniform(1.3, 2.2)
+
+            # Key distance factor
+            if i >= 1:
+                prev = self.code[i - 1]
+                pa = _QWERTY_POS.get(prev.lower())
+                pb = _QWERTY_POS.get(ch.lower())
+                if pa and pb:
+                    dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                    if dist < 0.5:
+                        d *= 0.7
+                    elif dist > 4:
+                        d *= 1.15
+
+            # Occasional thinking pause
+            if rng.random() < 0.012:
+                d += rng.uniform(0.4, 1.4)
+
+            self.display_chars.append(ch)
+            events.append((t, len(self.display_chars) - 1, ch))
+            t += max(d, 0.012)
+
+        # Add start/end pauses
+        sp = self.start_pause
+        events = [(ts + sp, idx, ch) for ts, idx, ch in events]
+        return events
+
+    def duration(self) -> float:
+        if not self.timeline:
+            return self.start_pause + self.end_pause
+        return self.timeline[-1][0] + self.end_pause
+
+    def visible_at(self, t: float) -> int:
+        if t < self.start_pause:
+            return 0
+        idx = bisect.bisect_right(self._timestamps, t)
+        if idx == 0:
+            return 0
+        return self.timeline[idx - 1][1] + 1
+
+    def char_timestamps(self) -> List[Tuple[float, str]]:
+        return [(ts, ch) for ts, _, ch in self.timeline]
+
+
+# =====================================================================
+# Code Renderer (PySide6 QPainter)
+# =====================================================================
+
+class CodeRenderer:
+    """Render a single frame of the typing animation into a QImage."""
+
+    TOKEN_COLOR_MAP = {
+        "keyword": "keyword", "builtin": "builtin", "string": "string",
+        "number": "number", "comment": "comment", "decorator": "decorator",
+        "function": "function", "class_name": "class_name",
+        "operator": "operator",
+    }
+
+    CURSOR_BLINK = 0.53
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        theme_name: str = "Dracula",
+        font_family: str = "Consolas",
+        font_size: int = 22,
+        show_line_numbers: bool = True,
+        show_window_chrome: bool = True,
+        padding: int = 50,
+        tab_size: int = 4,
+        title_text: str = "main.py",
+        language: str = "Python",
+        keyboard_overlay: Optional["KeyboardOverlay"] = None,
+        bg_image_path: Optional[str] = None,
+    ):
+        self.width = width
+        self.height = height
+        self.theme = THEMES.get(theme_name, THEMES["Dracula"])
+        self.font_family = font_family
+        self.font_size = font_size
+        self.show_line_numbers = show_line_numbers
+        self.show_window_chrome = show_window_chrome
+        self.padding = padding
+        self.tab_size = tab_size
+        self.title_text = title_text
+        self.language = language
+        self.keyboard_overlay = keyboard_overlay
+
+        self.font = QFont(font_family, font_size)
+        self.font.setFixedPitch(True)
+        self.fm = QFontMetrics(self.font)
+        self.char_w = self.fm.horizontalAdvance("M")
+        self.line_h = self.fm.height()
+
+        # Pre-convert theme colours to QColor once
+        self._qcolors: Dict[str, QColor] = {}
+        for key, val in self.theme.items():
+            if isinstance(val, str) and val.startswith("#"):
+                self._qcolors[key] = QColor(val)
+        self._qc_fg = self._qcolors.get("foreground", QColor("#f8f8f2"))
+        self._qc_ln = self._qcolors.get("line_number", QColor("#6272a4"))
+        self._qc_ln_active = QColor(self._qc_fg).darker(120)
+        self._qc_cursor = self._qcolors.get("cursor", QColor("#f8f8f2"))
+        self._qc_current_line = self._qcolors.get(
+            "current_line", QColor("#44475a")
+        )
+
+        # Background image
+        self.bg_image: Optional[QPixmap] = None
+        if bg_image_path and os.path.exists(bg_image_path):
+            self.bg_image = QPixmap(bg_image_path)
+
+        self._build_bg_cache()
+
+        # Token color cache per line text  (kept for backward compat)
+        self._token_cache: Dict[str, List[Tuple[str, str, int]]] = {}
+
+        # Backspace / typo resolution cache
+        self._cached_display_chars_id: int = 0
+        self._cached_display_chars_len: int = 0
+        self._cached_resolved: str = ""
+        self._cached_resolved_colors: List[str] = []
+        self._cached_is_clean: List[bool] = []
+        self._cached_stack_len: List[int] = []
+        self._cached_resolved_color_qc: List[QColor] = []
+
+        # Per-line x-position layout cache (FIFO eviction)
+        self._LINE_CACHE_MAX = 512
+        self._line_layout_cache: "OrderedDict[str, Tuple[List[int], int]]" = OrderedDict()
+        self._tab_advance = self.char_w * self.tab_size
+
+    def set_background_image(self, path: Optional[str]):
+        """Set (or clear) the background image and rebuild the cache."""
+        if path and os.path.exists(path):
+            self.bg_image = QPixmap(path)
+        else:
+            self.bg_image = None
+        self._build_bg_cache()
+
+    def _draw_bg(self, p: QPainter):
+        """Fill the frame background — image or gradient."""
+        if self.bg_image:
+            scaled = self.bg_image.scaled(
+                self.width, self.height,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self.width - scaled.width()) // 2
+            y = (self.height - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            bg = self._qcolors.get("background", QColor("#282a36"))
+            g = QLinearGradient(0, 0, 0, self.height)
+            g.setColorAt(0, bg.lighter(105))
+            g.setColorAt(1, bg)
+            p.fillRect(0, 0, self.width, self.height, g)
+
+    def _build_bg_cache(self):
+        """Pre-render the static background + window chrome."""
+        self._bg = QImage(self.width, self.height, QImage.Format_RGB32)
+        self._bg.fill(QColor(self.theme["background"]))
+        p = QPainter(self._bg)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Layer the background (image or gradient) behind the window chrome
+        p.save()
+        self._draw_bg(p)
+        p.restore()
+
+        w, h = self.width, self.height
+        pad = self.padding
+        chrome_h = 42 if self.show_window_chrome else 0
+
+        # Keyboard overlay reservation
+        kb_reserve = self.keyboard_overlay.height_needed() if self.keyboard_overlay else 0
+
+        # Window area
+        wx = pad
+        wy = pad
+        ww = w - 2 * pad
+        wh = h - 2 * pad - kb_reserve
+
+        # Window border — with drop shadow
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 60))
+        p.drawRoundedRect(wx + 4, wy + 4, ww, wh, 12, 12)
+        p.setPen(QColor(self.theme["window_border"]))
+        p.setBrush(QColor(self.theme["background"]))
+        r = 12
+        p.drawRoundedRect(wx, wy, ww, wh, r, r)
+
+        if self.show_window_chrome:
+            # Title bar
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.theme["title_bar"]))
+            p.drawRoundedRect(wx, wy, ww, chrome_h, r, r)
+            # Cover bottom corners of title bar
+            p.drawRect(wx, wy + chrome_h - r, ww, r)
+
+            # Traffic lights with glyph icons
+            btn_r = 7
+            btn_y = wy + 19
+            glyphs = {"button_close": "×", "button_min": "−", "button_max": "+"}
+            glyph_colors = ["#ff5f56", "#ffbd2e", "#27c93f"]
+            glyph_shadow = QColor(0, 0, 0, 100)
+            glyph_font = QFont("Arial", 7, QFont.Weight.Bold)
+            for i, color in enumerate(glyph_colors):
+                cx = wx + 20 + i * 24
+                p.setBrush(QColor(color))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QPoint(cx, btn_y), btn_r, btn_r)
+                p.setPen(glyph_shadow)
+                p.setFont(glyph_font)
+                p.drawText(
+                    QRect(cx - btn_r, btn_y - btn_r, btn_r * 2, btn_r * 2),
+                    Qt.AlignmentFlag.AlignCenter,
+                    glyphs[["button_close", "button_min", "button_max"][i]],
+                )
+
+            # Title text
+            p.setPen(QColor(self.theme["title_text"]))
+            p.setFont(QFont(self.font_family, 12))
+            p.drawText(
+                QRect(wx, wy, ww, chrome_h),
+                Qt.AlignCenter,
+                self.title_text,
+            )
+
+            code_top = wy + chrome_h
+        else:
+            code_top = wy
+
+        self._code_rect = QRect(
+            wx + 12, code_top + 4, ww - 24, wh - (code_top - wy) - 8
+        )
+        p.end()
+
+    @staticmethod
+    def auto_font_size(
+        code_lines: int, width: int, height: int,
+        padding: int = 50, show_window_chrome: bool = True,
+        show_line_numbers: bool = True, tab_size: int = 4,
+        code: Optional[str] = None, font_family: str = "Consolas",
+        keyboard_h: int = 0,
+    ) -> int:
+        chrome_h = 42 if show_window_chrome else 0
+        avail_h = height - 2 * padding - chrome_h - 8 - keyboard_h
+        avail_w = width - 2 * padding - 24
+        if show_line_numbers:
+            avail_w -= 50
+
+        fm = QFontMetrics(QFont(font_family, 20))
+        cw = fm.horizontalAdvance("M")
+        lh = fm.height()
+
+        max_font_by_h = avail_h / (code_lines * lh) * 20
+        max_chars = 120
+        if code:
+            longest = max(
+                len(line.replace("\t", " " * tab_size)) for line in code.split("\n")
+            )
+            max_chars = max(longest + 5, 40)
+        max_font_by_w = avail_w / (max_chars * cw) * 20
+
+        return int(min(max_font_by_h, max_font_by_w, 40))
+
+    @staticmethod
+    def _resolve_backspaces(chars: List[str]) -> str:
+        """Process ``\\b`` characters to produce the final visible string."""
+        out: List[str] = []
+        for ch in chars:
+            if ch == "\b":
+                if out:
+                    out.pop()
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    @staticmethod
+    def _precompute_clean(
+        display_chars: List[str], resolved: str,
+    ) -> Tuple[List[bool], List[int]]:
+        """Precompute ``is_clean[]`` and ``stack_len[]`` tables.
+
+        ``is_clean[i]`` is True iff processing ``display_chars[:i]``
+        yields a string that is a prefix of ``resolved`` (i.e. no
+        unresolved typo is currently on screen).
+
+        ``stack_len[i]`` is the length of the visible string after
+        processing ``display_chars[:i]``.
+        """
+        n = len(display_chars)
+        is_clean: List[bool] = [True] * (n + 1)
+        stack_len: List[int] = [0] * (n + 1)
+        stack: List[Tuple[str, bool]] = []
+        incorrect = 0
+        rlen = len(resolved)
+
+        for i in range(n):
+            ch = display_chars[i]
+            if ch == "\b":
+                if stack:
+                    _, was_correct = stack.pop()
+                    if not was_correct:
+                        incorrect -= 1
+            else:
+                pos = len(stack)
+                was_correct = pos < rlen and ch == resolved[pos]
+                stack.append((ch, was_correct))
+                if not was_correct:
+                    incorrect += 1
+            is_clean[i + 1] = (incorrect == 0)
+            stack_len[i + 1] = len(stack)
+
+        return is_clean, stack_len
+
+    def _get_cache(
+        self, full_text: List[str],
+    ) -> Tuple[str, List[str], List[QColor], List[bool], List[int]]:
+        """Return (resolved, resolved_colors, color_qc, is_clean, stack_len).
+
+        Recomputes only when *full_text* is a different list object
+        (compared by ``id()`` and length) than the one currently cached.
+        This avoids redundant work on every frame when the char list
+        hasn't changed between ticks.
+        """
+        cid = id(full_text)
+        clen = len(full_text)
+        if cid != self._cached_display_chars_id or clen != self._cached_display_chars_len:
+            resolved = self._resolve_backspaces(full_text)
+            self._cached_resolved = resolved
+            self._cached_resolved_colors = self._tokenize_to_colors(resolved)
+            # Pre-convert to QColor once
+            fg = self._qc_fg
+            qc = self._qcolors
+            self._cached_resolved_color_qc = [
+                qc.get(ck, fg) for ck in self._cached_resolved_colors
+            ]
+            self._cached_is_clean, self._cached_stack_len = (
+                self._precompute_clean(full_text, resolved)
+            )
+            self._cached_display_chars_id = cid
+            self._cached_display_chars_len = clen
+
+        return (
+            self._cached_resolved,
+            self._cached_resolved_colors,
+            self._cached_resolved_color_qc,
+            self._cached_is_clean,
+            self._cached_stack_len,
+        )
+
+    def _get_line_layout(self, line: str, x0: int) -> Tuple[List[int], int]:
+        """Return (char_x_positions[], total_width) for *line*.
+
+        *x0* is the pixel x-coordinate where the first character starts.
+        Results are cached in an OrderedDict with FIFO eviction (max 512
+        unique lines).  Uses actual ``horizontalAdvance`` per character
+        instead of a fixed ``char_w`` assumption, so CJK / ligature /
+        non-monospace glyphs are positioned accurately.
+        """
+        # Cache key includes x0 so different layouts don't collide
+        cache_key = (line, x0)
+        cached = self._line_layout_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        char_x: List[int] = []
+        x = x0
+        tab = self._tab_advance
+        ham = self.fm.horizontalAdvance
+        for ch in line:
+            char_x.append(x)
+            x += tab if ch == "\t" else ham(ch)
+        result = (char_x, x)
+        if len(self._line_layout_cache) >= self._LINE_CACHE_MAX:
+            self._line_layout_cache.popitem(last=False)  # FIFO evict
+        self._line_layout_cache[cache_key] = result
+        return result
+
+    def _tokenize_to_colors(self, text: str) -> List[str]:
+        """Tokenise *text* once and return a per-char colour-key list."""
+        tokens = Tokenizer.tokenize(text, self.language)
+        colors: List[str] = ["foreground"] * len(text)
+        pos = 0
+        get = self.TOKEN_COLOR_MAP.get
+        n = len(colors)
+        for ttype, ttxt in tokens:
+            ckey = get(ttype, "foreground")
+            end = min(pos + len(ttxt), n)
+            colors[pos:end] = [ckey] * (end - pos)
+            pos = end
+        return colors
+
+    def render_frame(
+        self,
+        display_chars: List[str],
+        num_visible: int,
+        cursor_visible: bool = True,
+        target: Optional[QImage] = None,
+        active_char: Optional[str] = None,
+        key_flash: float = 0.0,
+    ) -> QImage:
+        img = target if target is not None else QImage(
+            self.width, self.height, QImage.Format_RGB32
+        )
+        if target is None:
+            img.fill(QColor(self.theme["background"]))
+
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        # Blit cached background
+        p.drawImage(0, 0, self._bg)
+
+        cr = self._code_rect
+
+        # --- Resolve backspaces & pick visible text via cache ---
+        resolved, resolved_colors, resolved_color_qc, is_clean, stack_len = (
+            self._get_cache(display_chars)
+        )
+
+        # Determine how many characters of the *resolved* (final) text
+        # are visible.  If the current num_visible is a "clean" point
+        # (no typo on screen), we can slice the already-tokenized
+        # resolved text directly — no re-tokenization needed.
+        if 0 <= num_visible < len(is_clean) and is_clean[num_visible]:
+            vl = stack_len[num_visible]
+            visible_text = resolved[:vl]
+            vis_color_qc = resolved_color_qc[:vl]
+        else:
+            # Dirty state: a typo or backspace is in progress.
+            # Fall back to resolving display_chars[:num_visible] and
+            # re-tokenizing that intermediate string.
+            dirty_chars = display_chars[:num_visible]
+            visible_text = self._resolve_backspaces(dirty_chars)
+            dirty_colors = self._tokenize_to_colors(visible_text)
+            fg = self._qc_fg
+            qc = self._qcolors
+            vis_color_qc = [qc.get(ck, fg) for ck in dirty_colors]
+
+        lines = visible_text.split("\n")
+
+        # --- Smart cursor-following scroll with margins ---
+        max_vis = max(1, cr.height() // self.line_h)
+        total_lines = len(lines)
+        cursor_line = visible_text.count("\n")
+        scroll_margin_top = 3
+        scroll_margin_bottom = min(5, max_vis - 1)
+        scroll = 0
+        if cursor_line >= scroll + max_vis - scroll_margin_bottom:
+            scroll = max(0, cursor_line - max_vis + scroll_margin_bottom + 1)
+        if cursor_line < scroll + scroll_margin_top:
+            scroll = max(0, cursor_line - scroll_margin_top)
+
+        # Line number width
+        ln_width = 0
+        if self.show_line_numbers:
+            ln_width = len(str(total_lines + scroll)) * self.char_w + 16
+
+        # Map cursor to screen coordinates
+        current_scroll_line = cursor_line - scroll
+
+        # Highlight current line
+        if 0 <= current_scroll_line < max_vis:
+            hl_y = cr.top() + current_scroll_line * self.line_h
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._qc_current_line)
+            p.drawRect(cr.left(), hl_y, cr.width(), self.line_h)
+
+        # Clip to code area
+        p.setClipRect(cr)
+
+        # --- Draw line numbers + code ---
+        p.setFont(self.font)
+        x0 = cr.left() + ln_width
+        y_base = cr.top()
+        n_vis_chars = len(visible_text)
+        fg = self._qc_fg
+
+        # Pre-compute line start offsets in visible_text
+        line_offsets: List[int] = []
+        off = 0
+        for line in lines:
+            line_offsets.append(off)
+            off += len(line) + 1
+
+        for si in range(max_vis):
+            li = scroll + si
+            if li >= total_lines:
+                break
+
+            line = lines[li]
+            y = y_base + si * self.line_h
+            global_off = line_offsets[li]
+
+            # Line number
+            if self.show_line_numbers:
+                p.setFont(self.font)
+                p.setPen(
+                    self._qc_ln_active if li == cursor_line else self._qc_ln
+                )
+                p.drawText(
+                    QRect(cr.left(), y, ln_width, self.line_h),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    str(li + 1),
+                )
+
+            p.setFont(self.font)
+
+            if not line:
+                # Empty line — just draw cursor if on this line
+                if cursor_visible and li == cursor_line:
+                    self._draw_caret(p, int(x0), int(y + 5))
+                continue
+
+            # --- Cached x-position layout + RLE colour draw ---
+            char_x, _ = self._get_line_layout(line, x0)
+
+            cur_qc = vis_color_qc[global_off] if global_off < n_vis_chars else fg
+            run_start = 0
+            for j in range(1, len(line) + 1):
+                next_qc = fg
+                if j < len(line):
+                    gp = global_off + j
+                    next_qc = vis_color_qc[gp] if gp < n_vis_chars else fg
+                if j == len(line) or next_qc is not cur_qc:
+                    # Draw this run as a single drawText call
+                    run_text = line[run_start:j].replace(
+                        "\t", " " * self.tab_size
+                    )
+                    p.setPen(cur_qc)
+                    p.drawText(
+                        QPoint(int(char_x[run_start]),
+                               int(y + self.line_h * 0.78)),
+                        run_text,
+                    )
+                    cur_qc = next_qc
+                    run_start = j
+
+            # Cursor — use cached char_x for precise positioning
+            if cursor_visible and li == cursor_line:
+                # Cursor is at end of the current line
+                n_ch = len(line)
+                if n_ch < len(char_x):
+                    cx = char_x[n_ch]
+                else:
+                    last_x = char_x[-1] if char_x else x0
+                    if line and line[-1] == "\t":
+                        cx = last_x + self._tab_advance
+                    elif line:
+                        cx = last_x + self.fm.horizontalAdvance(line[-1])
+                    else:
+                        cx = last_x
+                self._draw_caret(p, int(cx), int(y + 5))
+
+        p.setClipping(False)
+
+        # Keyboard overlay
+        if self.keyboard_overlay:
+            ak = None
+            kf = 0.0
+            if active_char is not None and key_flash > 0:
+                ak = self.keyboard_overlay.resolve_key(active_char)
+                kf = key_flash
+            self.keyboard_overlay.draw(p, active_key=ak, flash=kf)
+
+        p.end()
+        return img
+
+    def _draw_caret(self, p: QPainter, x: int, y: int):
+        """Draw the text cursor (caret) as a thin filled rect."""
+        w = max(2, self.font_size // 10)
+        p.fillRect(x, y, w, self.line_h - 10, self._qc_cursor)
+
+
+# =====================================================================
+# FFmpeg Video Exporter
+# =====================================================================
+
+def _format_eta(seconds: float) -> str:
+    """Format a number of seconds into a human-readable ETA string.
+
+    Returns e.g. ``"1m 23s"``, ``"45s"``, or ``"< 1s"``.
+    """
+    if seconds < 1:
+        return "< 1s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds) // 60
+    secs = int(seconds) % 60
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m {secs}s"
+
+
+class VideoExporter(QThread):
+    """Render frames and pipe them to FFmpeg."""
+
+    progress = Signal(int)
+    status = Signal(str)
+    finished_ok = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        code: str,
+        output: str,
+        renderer: CodeRenderer,
+        animator: TypingAnimator,
+        fps: int = 30,
+        sound_gen: Optional[SimpleSoundGen] = None,
+        volume: float = 0.5,
+    ):
+        super().__init__()
+        self.code = code
+        self.output = output
+        self.renderer = renderer
+        self.animator = animator
+        self.fps = fps
+        self.sound_gen = sound_gen
+        self.volume = volume
+        self._cancel = threading.Event()
+        self._raw_buf = np.empty(
+            (renderer.height, renderer.width, 3), dtype=np.uint8
+        )
+
+    def cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            os.makedirs(TMP_DIR, exist_ok=True)
+            tmp = tempfile.mkdtemp(dir=TMP_DIR, prefix="sctvg_")
+            aud_path = os.path.join(tmp, "audio.wav")
+
+            total = self.animator.duration()
+            n_frames = max(1, int(total * self.fps))
+            w, h = self.renderer.width, self.renderer.height
+
+            log.info(
+                "Exporting %d frames (%.1fs @ %d fps) -> %s",
+                n_frames, total, self.fps, os.path.basename(self.output),
+            )
+
+            self.status.emit(f"Generating audio...")
+            has_audio = False
+            if self.sound_gen:
+                t_audio = _time.perf_counter()
+                self.sound_gen.generate_track(
+                    self.animator.char_timestamps(), aud_path, self.volume
+                )
+                aud_elapsed = _time.perf_counter() - t_audio
+                aud_size = os.path.getsize(aud_path) if os.path.exists(aud_path) else 0
+                log.info(
+                    "Audio generated in %.2fs (%.2f MB)",
+                    aud_elapsed, aud_size / (1024 * 1024),
+                )
+                has_audio = aud_size > 44
+
+            # Build FFmpeg command
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{w}x{h}", "-r", str(self.fps),
+                "-i", "pipe:0",
+            ]
+            if has_audio:
+                cmd += ["-i", aud_path]
+            cmd += [
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            ]
+            if has_audio:
+                cmd += ["-c:a", "aac", "-b:a", "192k"]
+            cmd.append(self.output)
+
+            self.status.emit(f"Encoding {n_frames} frames...")
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+
+            stderr_chunks: list[bytes] = []
+            def _drain():
+                while True:
+                    chunk = proc.stderr.read(8192)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            drain_t = threading.Thread(target=_drain, daemon=True)
+            drain_t.start()
+
+            scratch = QImage(w, h, QImage.Format_RGB32)
+            frame_size = w * h * 3
+
+            export_start = _time.time()
+            frame_render_total = 0.0
+
+            log.info(
+                "Starting frame render + encode pipeline (%d frames @ %dx%d)...",
+                n_frames, w, h,
+            )
+
+            for fi in range(n_frames):
+                if self._cancel.is_set():
+                    log.info("Export cancelled by user at frame %d/%d.", fi, n_frames)
+                    proc.stdin.close()
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    self.error.emit("Cancelled")
+                    return
+
+                t = fi / self.fps
+                nv = self.animator.visible_at(t)
+
+                # Cursor blink
+                cur_vis = True
+                if nv > 0:
+                    idx = bisect.bisect_right(self.animator._timestamps, t)
+                    if idx > 0:
+                        last_ts = self.animator.timeline[idx - 1][0]
+                        if t - last_ts > 0.25:
+                            cur_vis = (int((t - last_ts) / self.renderer.CURSOR_BLINK) % 2) == 0
+
+                # Determine active key for keyboard overlay
+                active_char = None
+                key_flash = 0.0
+                if nv > 0:
+                    idx2 = bisect.bisect_right(self.animator._timestamps, t)
+                    if idx2 > 0:
+                        active_char = self.animator.timeline[idx2 - 1][2]
+                        dt = t - self.animator.timeline[idx2 - 1][0]
+                        if dt < 0.18:
+                            key_flash = max(0.0, 1.0 - dt / 0.18)
+                        else:
+                            active_char = None
+
+                rt0 = _time.perf_counter()
+                qimg = self.renderer.render_frame(
+                    self.animator.display_chars, nv, cur_vis, target=scratch,
+                    active_char=active_char, key_flash=key_flash,
+                )
+                frame_render_total += _time.perf_counter() - rt0
+
+                raw = self._qimg_to_rgb(qimg)
+                proc.stdin.write(raw)
+
+                if fi % max(1, n_frames // 20) == 0 and fi > 0:
+                    pct = int((fi + 1) / n_frames * 100)
+                    elapsed = _time.time() - export_start
+                    eta = elapsed / (fi + 1) * (n_frames - fi - 1)
+                    avg_ms = frame_render_total / (fi + 1) * 1000
+                    render_fps = (fi + 1) / frame_render_total if frame_render_total > 0 else 0
+                    log.info(
+                        "Progress: %d%% (%d/%d frames, %.1fs elapsed, "
+                        "ETA %s, %.1f ms/frame, %.1f render fps)",
+                        pct, fi + 1, n_frames, elapsed,
+                        _format_eta(eta), avg_ms, render_fps,
+                    )
+                    self.progress.emit(pct)
+                    self.status.emit(
+                        f"Encoding... {pct}% (ETA: {_format_eta(eta)})"
+                    )
+
+            proc.stdin.close()
+            proc.wait(timeout=600)
+            drain_t.join(timeout=5)
+
+            if proc.returncode != 0:
+                err = b"".join(stderr_chunks).decode(errors="ignore")[-600:]
+                raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {err}")
+
+            total_export_time = _time.time() - export_start
+            if n_frames > 0 and frame_render_total > 0:
+                avg_ms = frame_render_total / n_frames * 1000
+                render_fps = n_frames / frame_render_total
+                log.info(
+                    "Render stats: %d frames in %.2fs total (%.1f ms/frame, "
+                    "%.1f fps render throughput, %.1fs wall clock)",
+                    n_frames, frame_render_total, avg_ms, render_fps,
+                    total_export_time,
+                )
+                self.status.emit(
+                    f"Rendered {n_frames} frames at {render_fps:.1f} fps "
+                    f"({avg_ms:.1f} ms/frame)"
+                )
+
+            self.progress.emit(100)
+            self.status.emit(f"Done -> {self.output}")
+            self.finished_ok.emit(self.output)
+
+        except Exception as e:
+            log.error("Export failed: %s", e, exc_info=True)
+            self.error.emit(str(e))
+
+    def _qimg_to_rgb(self, qimg: QImage) -> bytes:
+        """Convert a QImage to raw RGB24 bytes for FFmpeg.
+
+        Fast path: if the image is Format_RGB32 with no scanline padding,
+        read the BGRA buffer directly via numpy and swap channels in-place
+        into the pre-allocated ``_raw_buf``, avoiding an expensive
+        ``convertToFormat(RGB888)`` copy (~6 MB at 1080p per call).
+        """
+        w, h = qimg.width(), qimg.height()
+        bpl = qimg.bytesPerLine()
+
+        # --- fast path: RGB32, no padding ---
+        if qimg.format() == QImage.Format_RGB32 and bpl == w * 4:
+            ptr = qimg.constBits()
+            if hasattr(ptr, "setsize"):
+                ptr.setsize(h * bpl)
+                arr = np.array(ptr, dtype=np.uint8).reshape((h, w, 4))
+                buf = self._raw_buf
+                buf[:, :, 0] = arr[:, :, 2]  # R
+                buf[:, :, 1] = arr[:, :, 1]  # G
+                buf[:, :, 2] = arr[:, :, 0]  # B
+                return buf.tobytes()
+
+        # --- fallback: convert to RGB888 ---
+        qimg = qimg.convertToFormat(QImage.Format_RGB888)
+        bpl = qimg.bytesPerLine()
+        ptr = qimg.constBits()
+        if isinstance(ptr, memoryview):
+            raw = ptr.tobytes()
+        elif hasattr(ptr, "setsize"):
+            ptr.setsize(h * bpl)
+            arr = np.array(ptr, dtype=np.uint8).reshape((h, bpl))
+            if bpl != w * 3:
+                arr = arr[:, :w * 3]
+            return np.ascontiguousarray(arr).tobytes()
+        else:
+            raw = bytes(ptr) if hasattr(ptr, "tobytes") else bytes(ptr)
+            raw = raw[:h * bpl]
+        if bpl == w * 3:
+            return raw
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpl))
+        return np.ascontiguousarray(arr[:, :w * 3]).tobytes()
+
+
+# =====================================================================
+# Layout Preview Dialog
+# =====================================================================
+
+_SAMPLE_CODE = '''import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class NeuralLayer:
+    """A single fully-connected layer."""
+    weights: np.ndarray
+    bias: np.ndarray
+    activation: str = "relu"
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        z = x @ self.weights + self.bias
+        if self.activation == "relu":
+            return np.maximum(0, z)
+        return 1.0 / (1.0 + np.exp(-z))
+
+def build_network(sizes: list[int]) -> list[NeuralLayer]:
+    layers = []
+    for i in range(len(sizes) - 1):
+        w = np.random.randn(sizes[i], sizes[i + 1]) * 0.01
+        b = np.zeros(sizes[i + 1])
+        layers.append(NeuralLayer(weights=w, bias=b))
+    return layers
+'''
+
+
+class _PreviewImageLabel(QLabel):
+    """Label that displays a QImage with smooth scaling."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(480, 270)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background: #11111b; border-radius: 8px;")
+
+    def set_preview_image(self, qimg: QImage):
+        self._pixmap = QPixmap.fromImage(qimg)
+        self._update_painted()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_painted()
+
+    def _update_painted(self):
+        if self._pixmap is None:
+            return
+        scaled = self._pixmap.scaled(
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class LayoutPreviewDialog(QDialog):
+    """Full-featured layout preview showing a rendered frame."""
+
+    def __init__(self, parent, renderer: "CodeRenderer", animator: "TypingAnimator",
+                 theme_name: str, resolution_name: str):
+        super().__init__(parent)
+        self.setWindowTitle("Layout Preview")
+        self.setMinimumSize(720, 540)
+        self.resize(900, 640)
+        self.renderer = renderer
+        self.animator = animator
+        self.theme_name = theme_name
+        self.resolution_name = resolution_name
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Header
+        header = QLabel(f"Preview  —  {theme_name}  |  {resolution_name}")
+        header.setStyleSheet("color: #cdd6f4; font-size: 15px; font-weight: bold;")
+        layout.addWidget(header)
+
+        # Preview image
+        self.preview_label = _PreviewImageLabel()
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(20)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(0, 0, 0, 120))
+        self.preview_label.setGraphicsEffect(shadow)
+        layout.addWidget(self.preview_label, stretch=1)
+
+        # Info bar
+        info_layout = QHBoxLayout()
+        self._render_time_lbl = QLabel()
+        self._render_time_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        info_layout.addWidget(self._render_time_lbl)
+
+        info_layout.addStretch()
+
+        # Navigation controls
+        self.prev_btn = QPushButton("◀ Prev")
+        self.prev_btn.setFixedWidth(80)
+        self.prev_btn.clicked.connect(self._prev_frame)
+        info_layout.addWidget(self.prev_btn)
+
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setRange(0, 100)
+        self.frame_slider.setValue(30)
+        self.frame_slider.setFixedWidth(200)
+        self.frame_slider.valueChanged.connect(self._on_slider)
+        info_layout.addWidget(self.frame_slider)
+
+        self.next_btn = QPushButton("Next ▶")
+        self.next_btn.setFixedWidth(80)
+        self.next_btn.clicked.connect(self._next_frame)
+        info_layout.addWidget(self.next_btn)
+
+        self.frame_lbl = QLabel("")
+        self.frame_lbl.setStyleSheet("color: #cdd6f4; font-size: 12px; min-width: 120px;")
+        self.frame_lbl.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(self.frame_lbl)
+
+        info_layout.addStretch()
+
+        # Play/pause animation
+        self.play_btn = QPushButton("▶ Animate")
+        self.play_btn.setObjectName("previewBtn")
+        self.play_btn.setFixedWidth(100)
+        self.play_btn.clicked.connect(self._toggle_animation)
+        info_layout.addWidget(self.play_btn)
+
+        layout.addLayout(info_layout)
+
+        # Buttons
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+        # Animation state
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._advance_animation)
+        self._animating = False
+        self._anim_t = 0.0
+
+        # Initial render
+        self._current_progress = 0.30
+        QTimer.singleShot(50, self._render_current)
+
+    def _render_current(self):
+        import time
+        t0 = time.perf_counter()
+        total_chars = len(self.animator.display_chars)
+        num_vis = int(total_chars * self._current_progress)
+        nv = self.animator.visible_at(self.animator.duration() * self._current_progress)
+        scratch = QImage(self.renderer.width, self.renderer.height, QImage.Format_RGB32)
+        qimg = self.renderer.render_frame(
+            self.animator.display_chars, nv, cursor_visible=True, target=scratch,
+        )
+        elapsed = time.perf_counter() - t0
+        self.preview_label.set_preview_image(qimg)
+        self._render_time_lbl.setText(
+            f"Frame rendered in {elapsed*1000:.1f} ms  |  "
+            f"{self.renderer.width}x{self.renderer.height}  |  "
+            f"Font: {self.renderer.font_family} {self.renderer.font_size}px"
+        )
+        self.frame_lbl.setText(f"Progress: {self._current_progress*100:.0f}%  ({nv}/{total_chars} chars)")
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(int(self._current_progress * 100))
+        self.frame_slider.blockSignals(False)
+
+    def _on_slider(self, value):
+        self._stop_animation()
+        self._current_progress = value / 100.0
+        self._render_current()
+
+    def _prev_frame(self):
+        self._stop_animation()
+        self._current_progress = max(0, self._current_progress - 0.05)
+        self._render_current()
+
+    def _next_frame(self):
+        self._stop_animation()
+        self._current_progress = min(1.0, self._current_progress + 0.05)
+        self._render_current()
+
+    def _toggle_animation(self):
+        if self._animating:
+            self._stop_animation()
+        else:
+            self._animating = True
+            self.play_btn.setText("⏸ Pause")
+            self._anim_t = self.animator.duration() * self._current_progress
+            self._timer.start()
+
+    def _advance_animation(self):
+        dt = 0.05
+        self._anim_t += dt
+        total = self.animator.duration()
+        if self._anim_t >= total:
+            self._anim_t = total
+            self._stop_animation()
+        self._current_progress = min(1.0, self._anim_t / total)
+        self._render_current()
+
+    def _stop_animation(self):
+        self._animating = False
+        self._timer.stop()
+        self.play_btn.setText("▶ Animate")
+
+
+# =====================================================================
+# Audio Preview Dialog
+# =====================================================================
+
+class _WaveformWidget(QWidget):
+    """Custom widget that draws an audio waveform from PCM int16 data."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pcm: Optional[np.ndarray] = None
+        self._sr = 44100
+        self._playhead = -1.0  # -1 = no playhead
+        self.setMinimumHeight(100)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background: #181825; border-radius: 6px;")
+
+    def set_waveform(self, pcm: np.ndarray, sr: int = 44100):
+        self._pcm = pcm
+        self._sr = sr
+        self._playhead = -1.0
+        self.update()
+
+    def set_playhead(self, fraction: float):
+        self._playhead = max(0.0, min(1.0, fraction))
+        self.update()
+
+    def clear_playhead(self):
+        self._playhead = -1.0
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor("#181825"))
+
+        if self._pcm is None or len(self._pcm) == 0:
+            p.setPen(QColor("#585b70"))
+            p.setFont(QFont("Segoe UI", 12))
+            p.drawText(self.rect(), Qt.AlignCenter, "No waveform")
+            p.end()
+            return
+
+        # Downsample waveform for display
+        n = len(self._pcm)
+        samples_per_pixel = max(1, n // w)
+        mid = h / 2
+        margin_y = 10
+        amplitude = (h / 2) - margin_y
+
+        # Draw center line
+        p.setPen(QPen(QColor("#313244"), 1))
+        p.drawLine(0, int(mid), w, int(mid))
+
+        # Draw waveform as filled path (top half + bottom half)
+        top_path = QPainterPath()
+        bot_path = QPainterPath()
+        top_path.moveTo(0, mid)
+        bot_path.moveTo(0, mid)
+
+        peaks_top = []
+        peaks_bot = []
+        for x in range(w):
+            start = x * samples_per_pixel
+            end = min(start + samples_per_pixel, n)
+            chunk = self._pcm[start:end].astype(np.float64) / 32768.0
+            if len(chunk) == 0:
+                peak = 0
+            else:
+                # RMS for smoother look
+                peak = float(np.sqrt(np.mean(chunk ** 2)))
+            peaks_top.append(mid - peak * amplitude)
+            peaks_bot.append(mid + peak * amplitude)
+
+        # Draw filled waveform with gradient
+        grad_top = QLinearGradient(0, 0, 0, int(mid))
+        grad_top.setColorAt(0, QColor("#89b4fa"))
+        grad_top.setColorAt(1, QColor("#89b4fa"))
+        grad_bot = QLinearGradient(0, int(mid), 0, h)
+        grad_bot.setColorAt(0, QColor("#89b4fa"))
+        grad_bot.setColorAt(1, QColor("#89b4fa"))
+
+        fill_path = QPainterPath()
+        fill_path.moveTo(0, int(mid))
+        for x in range(w):
+            fill_path.lineTo(x, peaks_top[x])
+        for x in range(w - 1, -1, -1):
+            fill_path.lineTo(x, peaks_bot[x])
+        fill_path.closeSubpath()
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(137, 180, 250, 50))
+        p.drawPath(fill_path)
+
+        # Draw the outline
+        p.setPen(QPen(QColor("#89b4fa"), 1.5))
+        for x in range(w):
+            p.drawLine(x, int(peaks_top[x]), x, int(peaks_bot[x]))
+
+        # Playhead
+        if 0 <= self._playhead <= 1:
+            px = int(self._playhead * (w - 1))
+            p.setPen(QPen(QColor("#f38ba8"), 2))
+            p.drawLine(px, 0, px, h)
+            # Small triangle at top
+            p.setBrush(QColor("#f38ba8"))
+            p.setPen(Qt.PenStyle.NoPen)
+            tri = QPainterPath()
+            tri.moveTo(px, 0)
+            tri.lineTo(px - 5, 8)
+            tri.lineTo(px + 5, 8)
+            tri.closeSubpath()
+            p.drawPath(tri)
+
+        # Time labels
+        p.setPen(QColor("#a6adc8"))
+        p.setFont(QFont("Segoe UI", 9))
+        duration_s = n / self._sr
+        p.drawText(6, h - 6, "0:00.0")
+        p.drawText(w - 70, h - 6, f"{duration_s:.1f}s")
+
+        p.end()
+
+
+class AudioPreviewDialog(QDialog):
+    """Professional audio preview with waveform visualization and individual key sounds."""
+
+    def __init__(self, parent, preset_name: str, volume: float = 0.5):
+        super().__init__(parent)
+        self.setWindowTitle(f"Audio Preview  —  {preset_name}")
+        self.setMinimumSize(580, 420)
+        self.resize(660, 480)
+        self.preset_name = preset_name
+        self.volume = volume
+
+        self._gen = SimpleSoundGen(preset=preset_name)
+        self._sr = self._gen.sr
+        self._player = QMediaPlayer()
+        self._audio_out = QAudioOutput()
+        self._player.setAudioOutput(self._audio_out)
+        self._audio_out.setVolume(volume)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # Header
+        desc = SOUND_PRESETS.get(preset_name, {}).get("description", "")
+        header = QLabel(f"🔊  {preset_name}")
+        header.setStyleSheet("color: #cdd6f4; font-size: 16px; font-weight: bold;")
+        layout.addWidget(header)
+        desc_lbl = QLabel(desc)
+        desc_lbl.setStyleSheet("color: #a6adc8; font-size: 12px; font-style: italic;")
+        layout.addWidget(desc_lbl)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #313244;")
+        layout.addWidget(sep)
+
+        # Waveform display
+        wave_label = QLabel("Waveform")
+        wave_label.setStyleSheet("color: #cdd6f4; font-size: 12px; font-weight: bold;")
+        layout.addWidget(wave_label)
+        self.waveform = _WaveformWidget()
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(12)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        self.waveform.setGraphicsEffect(shadow)
+        layout.addWidget(self.waveform, stretch=1)
+
+        # Individual sound buttons
+        indiv_label = QLabel("Individual Key Sounds")
+        indiv_label.setStyleSheet("color: #cdd6f4; font-size: 12px; font-weight: bold;")
+        layout.addWidget(indiv_label)
+
+        indiv_layout = QHBoxLayout()
+        indiv_layout.setSpacing(10)
+        for label, char in [("⌨  Click", "a"), ("⎵  Space", " "), ("↵  Enter", "\n")]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(34)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #313244; color: #cdd6f4; border: 1px solid #45475a;
+                    border-radius: 6px; padding: 6px 18px; font-size: 13px;
+                }
+                QPushButton:hover { background: #45475a; }
+            """)
+            btn.clicked.connect(lambda checked, c=char: self._play_individual(c))
+            indiv_layout.addWidget(btn)
+        indiv_layout.addStretch()
+        layout.addLayout(indiv_layout)
+
+        # Demo sequence + volume
+        demo_row = QHBoxLayout()
+        self.demo_btn = QPushButton("▶  Play Demo Sequence")
+        self.demo_btn.setObjectName("previewBtn")
+        self.demo_btn.setFixedHeight(38)
+        self.demo_btn.clicked.connect(self._play_demo)
+        demo_row.addWidget(self.demo_btn)
+
+        demo_row.addStretch()
+
+        vol_label = QLabel("Volume:")
+        vol_label.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        demo_row.addWidget(vol_label)
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(int(volume * 100))
+        self.vol_slider.setFixedWidth(120)
+        self.vol_slider.setStyleSheet("""
+            QSlider::groove:horizontal { background: #313244; height: 6px; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #89b4fa; width: 16px; height: 16px;
+                margin: -5px 0; border-radius: 8px; }
+        """)
+        self.vol_slider.valueChanged.connect(self._on_vol_change)
+        demo_row.addWidget(self.vol_slider)
+        self.vol_pct = QLabel(f"{int(volume * 100)}%")
+        self.vol_pct.setStyleSheet("color: #a6adc8; font-size: 12px; min-width: 36px;")
+        demo_row.addWidget(self.vol_pct)
+        layout.addLayout(demo_row)
+
+        # Close button
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.close)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+        # Generate and show demo waveform on open
+        self._demo_pcm = None
+        QTimer.singleShot(50, self._generate_demo_waveform)
+
+    def _generate_demo_waveform(self):
+        """Generate a realistic demo sequence waveform for display."""
+        # Realistic code-typing sequence
+        samples = [
+            ("d", 0.00), ("e", 0.09), ("f", 0.17), (" ", 0.24),
+            ("c", 0.34), ("l", 0.42), ("a", 0.49), ("s", 0.56), ("s", 0.63),
+            (" ", 0.70), ("M", 0.80), ("y", 0.88), ("C", 0.96), ("l", 1.04),
+            ("a", 1.10), ("s", 1.17), ("s", 1.24), (":", 1.34), ("\n", 1.50),
+            (" ", 2.00), (" ", 2.06), (" ", 2.12), ("d", 2.22), ("e", 2.30),
+            ("f", 2.37), (" ", 2.44), ("_", 2.54), ("_", 2.61), ("i", 2.68),
+            ("n", 2.75), ("i", 2.82), ("t", 2.89), ("_", 3.00), ("_", 3.07),
+            ("s", 3.14), ("e", 3.21), ("l", 3.28), ("f", 3.35), (":", 3.46),
+            ("\n", 3.60), (" ", 4.10), (" ", 4.16), (" ", 4.22), (" ", 4.28),
+            ("r", 4.38), ("e", 4.45), ("t", 4.52), ("u", 4.59), ("r", 4.66),
+            ("n", 4.73), (" ", 4.80), ("s", 4.90), ("e", 4.97), ("l", 5.04),
+            ("f", 5.11), ("\n", 5.35),
+        ]
+        max_end = 0
+        for ch_char, ts in samples:
+            snd = self._gen._pick(ch_char)
+            end = ts + len(snd) / self._sr
+            if end > max_end:
+                max_end = end
+        n_total = int(self._sr * (max_end + 0.5))
+        mix = np.zeros(n_total, dtype=np.float64)
+        for ch, ts in samples:
+            snd = self._gen._pick(ch).astype(np.float64) * self.volume
+            s = int(ts * self._sr)
+            e = min(s + len(snd), n_total)
+            if s < n_total:
+                mix[s:e] += snd[:e - s]
+        peak = np.max(np.abs(mix))
+        if peak > 0:
+            mix = mix * (32767 * 0.9 / peak)
+        self._demo_pcm = np.clip(mix, -32768, 32767).astype(np.int16)
+        self._demo_samples = samples
+        self.waveform.set_waveform(self._demo_pcm, self._sr)
+
+    def _play_individual(self, char: str):
+        """Play a single key sound and flash the waveform."""
+        snd = self._gen._pick(char).astype(np.float64) * self.volume
+        peak = np.max(np.abs(snd))
+        if peak > 0:
+            snd = snd * (32767 * 0.9 / peak)
+        pcm = np.clip(snd, -32768, 32767).astype(np.int16)
+        # Show waveform
+        self.waveform.set_waveform(pcm, self._sr)
+        # Play
+        tmp_path = os.path.join(TMP_DIR, "_preview_indiv.wav")
+        os.makedirs(TMP_DIR, exist_ok=True)
+        with wave.open(tmp_path, "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self._sr)
+            w.writeframes(pcm.tobytes())
+        self._audio_out.setVolume(self.volume)
+        self._player.setSource(QUrl.fromLocalFile(os.path.abspath(tmp_path)))
+        self._player.play()
+        # Restore full waveform after sound plays
+        QTimer.singleShot(800, self._restore_demo_waveform)
+
+    def _restore_demo_waveform(self):
+        if self._demo_pcm is not None:
+            self.waveform.set_waveform(self._demo_pcm, self._sr)
+
+    def _play_demo(self):
+        """Play the full demo sequence with animated playhead."""
+        if self._demo_pcm is None:
+            return
+        self.waveform.set_waveform(self._demo_pcm, self._sr)
+        # Write to temp WAV
+        tmp_path = os.path.join(TMP_DIR, "_preview_demo.wav")
+        os.makedirs(TMP_DIR, exist_ok=True)
+        with wave.open(tmp_path, "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self._sr)
+            w.writeframes(self._demo_pcm.tobytes())
+        self._audio_out.setVolume(self.volume)
+        self._player.setSource(QUrl.fromLocalFile(os.path.abspath(tmp_path)))
+        self._player.play()
+        # Animate playhead
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(30)
+        self._playback_start = 0  # not used precisely, just fraction
+        duration_ms = len(self._demo_pcm) / self._sr * 1000
+        self._playback_timer.timeout.connect(
+            lambda: self.waveform.set_playhead(self._player.position() / max(1, self._player.duration()))
+        )
+        self._playback_timer.start()
+        # Stop playhead when done
+        def _on_finished():
+            self._playback_timer.stop()
+            self.waveform.clear_playhead()
+            try:
+                self._player.positionChanged.disconnect()
+            except RuntimeError:
+                pass
+        self._player.positionChanged.connect(
+            lambda pos: _on_finished() if pos >= self._player.duration() - 60 else None
+        )
+        self.demo_btn.setEnabled(False)
+        self.demo_btn.setText("♪  Playing...")
+        self._player.positionChanged.connect(
+            lambda pos: (
+                self.demo_btn.setEnabled(True),
+                self.demo_btn.setText("▶  Play Demo Sequence"),
+                self._playback_timer.stop(),
+                self.waveform.clear_playhead(),
+            ) if pos >= self._player.duration() - 60 else None
+        )
+
+    def _on_vol_change(self, val):
+        vol = val / 100.0
+        self._audio_out.setVolume(vol)
+        self.vol_pct.setText(f"{val}%")
+
+    def closeEvent(self, event):
+        self._player.stop()
+        super().closeEvent(event)
+
+
+# =====================================================================
+# Main Window — checkbox-based program selector
+# =====================================================================
+
+@dataclass
+class FileItem:
+    path: str
+    checked: bool = False
+    status: str = "Pending"  # Pending / Rendering / Done / Failed
+    output_path: Optional[str] = None
+    error: Optional[str] = None
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Simple Code Typing Video Generator")
+        self.setMinimumSize(750, 600)
+        self.resize(850, 700)
+
+        self._items: List[FileItem] = []
+        self._exporter: Optional[VideoExporter] = None
+        self._export_queue: List[FileItem] = []
+        self._loading_settings = False  # guard to prevent save-during-load
+
+        self._build_ui()
+        self._connect_settings_signals()
+        self._load_settings()
+        self._scan_input_dir()
+
+    # ── UI construction ─────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        # --- File list group ---
+        file_group = QGroupBox("Programs (check to export)")
+        fg_lay = QVBoxLayout(file_group)
+
+        # Buttons row 1: scan controls
+        btn_row = QHBoxLayout()
+        self.scan_btn = QPushButton("Scan input/ folder")
+        self.scan_btn.clicked.connect(self._scan_input_dir)
+        btn_row.addWidget(self.scan_btn)
+
+        self.scan_folder_btn = QPushButton("Choose Folder...")
+        self.scan_folder_btn.clicked.connect(self._scan_folder)
+        btn_row.addWidget(self.scan_folder_btn)
+
+        self.add_btn = QPushButton("Add files...")
+        self.add_btn.clicked.connect(self._add_files)
+        btn_row.addWidget(self.add_btn)
+
+        btn_row.addStretch()
+
+        # Recursive depth control
+        self.recurse_chk = QCheckBox("Recursive")
+        self.recurse_chk.setChecked(True)
+        self.recurse_chk.setToolTip("Scan subfolders recursively")
+        btn_row.addWidget(self.recurse_chk)
+
+        btn_row.addWidget(QLabel("Depth:"))
+        self.depth_sp = QSpinBox()
+        self.depth_sp.setRange(1, 99)
+        self.depth_sp.setValue(10)
+        self.depth_sp.setToolTip("Max recursion depth (1 = only root folder)")
+        self.depth_sp.setFixedWidth(60)
+        btn_row.addWidget(self.depth_sp)
+        fg_lay.addLayout(btn_row)
+
+        # Buttons row 2: selection + file count
+        btn_row2 = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self._select_all)
+        btn_row2.addWidget(self.select_all_btn)
+
+        self.deselect_all_btn = QPushButton("Deselect All")
+        self.deselect_all_btn.clicked.connect(self._deselect_all)
+        btn_row2.addWidget(self.deselect_all_btn)
+
+        self.file_count_lbl = QLabel("")
+        self.file_count_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        btn_row2.addWidget(self.file_count_lbl)
+
+        btn_row2.addStretch()
+        fg_lay.addLayout(btn_row2)
+
+        # Table
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Export", "Path", "Language", "Status"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Fixed)
+        hdr.resizeSection(0, 60)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)
+        hdr.resizeSection(2, 90)
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.itemChanged.connect(self._on_item_changed)
+        fg_lay.addWidget(self.table)
+        root.addWidget(file_group, stretch=1)
+
+        # --- Settings group ---
+        settings_group = QGroupBox("Settings")
+        sg = QGridLayout(settings_group)
+        sg.setSpacing(8)
+        row = 0
+
+        sg.addWidget(QLabel("Theme:"), row, 0)
+        self.theme_cb = QComboBox()
+        self.theme_cb.addItems(list(THEMES.keys()))
+        self.theme_cb.setCurrentText("Dracula")
+        sg.addWidget(self.theme_cb, row, 1)
+
+        sg.addWidget(QLabel("Resolution:"), row, 2)
+        self.res_cb = QComboBox()
+        self.res_cb.addItems(list(RESOLUTIONS.keys()))
+        self.res_cb.setCurrentText("1920x1080")
+        sg.addWidget(self.res_cb, row, 3)
+
+        row += 1
+        sg.addWidget(QLabel("WPM:"), row, 0)
+        self.wpm_sp = QSpinBox()
+        self.wpm_sp.setRange(30, 300)
+        self.wpm_sp.setValue(100)
+        sg.addWidget(self.wpm_sp, row, 1)
+
+        sg.addWidget(QLabel("FPS:"), row, 2)
+        self.fps_sp = QSpinBox()
+        self.fps_sp.setRange(10, 60)
+        self.fps_sp.setValue(30)
+        sg.addWidget(self.fps_sp, row, 3)
+
+        row += 1
+        sg.addWidget(QLabel("Start Pause (s):"), row, 0)
+        self.start_pause_sp = QDoubleSpinBox()
+        self.start_pause_sp.setRange(0, 10)
+        self.start_pause_sp.setSingleStep(0.5)
+        self.start_pause_sp.setValue(0.5)
+        sg.addWidget(self.start_pause_sp, row, 1)
+
+        sg.addWidget(QLabel("End Pause (s):"), row, 2)
+        self.end_pause_sp = QDoubleSpinBox()
+        self.end_pause_sp.setRange(0, 10)
+        self.end_pause_sp.setSingleStep(0.5)
+        self.end_pause_sp.setValue(1.5)
+        sg.addWidget(self.end_pause_sp, row, 3)
+
+        row += 1
+        self.sound_chk = QCheckBox("Typing Sounds")
+        self.sound_chk.setChecked(True)
+        self.sound_chk.toggled.connect(self._on_sound_toggled)
+        sg.addWidget(self.sound_chk, row, 0, 1, 2)
+
+        sg.addWidget(QLabel("Volume:"), row, 2)
+        self.vol_sl = QSpinBox()
+        self.vol_sl.setRange(0, 100)
+        self.vol_sl.setValue(50)
+        self.vol_sl.setSuffix("%")
+        sg.addWidget(self.vol_sl, row, 3)
+
+        row += 1
+        sg.addWidget(QLabel("Sound Preset:"), row, 0)
+        self.sound_preset_cb = QComboBox()
+        self.sound_preset_cb.addItems(list(SOUND_PRESETS.keys()))
+        self.sound_preset_cb.setCurrentText("Mechanical")
+        self.sound_preset_cb.currentTextChanged.connect(self._on_preset_changed)
+        sg.addWidget(self.sound_preset_cb, row, 1)
+
+        self.preset_desc_lbl = QLabel(SOUND_PRESETS["Mechanical"]["description"])
+        self.preset_desc_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; font-style: italic;")
+        sg.addWidget(self.preset_desc_lbl, row, 2, 1, 1)
+
+        self.preview_btn = QPushButton("\u25b6 Preview Sound")
+        self.preview_btn.setObjectName("previewBtn")
+        self.preview_btn.clicked.connect(self._preview_sound)
+        sg.addWidget(self.preview_btn, row, 3)
+
+        row += 1
+        self.kb_overlay_chk = QCheckBox("Keyboard Overlay")
+        self.kb_overlay_chk.setChecked(False)
+        self.kb_overlay_chk.toggled.connect(self._on_kb_overlay_toggled)
+        sg.addWidget(self.kb_overlay_chk, row, 0, 1, 1)
+
+        sg.addWidget(QLabel("Layout:"), row, 1)
+        self.kb_layout_cb = QComboBox()
+        self.kb_layout_cb.addItems(list(KEYBOARD_LAYOUTS.keys()))
+        self.kb_layout_cb.setCurrentText("QWERTY")
+        self.kb_layout_cb.setEnabled(False)
+        self.kb_layout_cb.currentTextChanged.connect(self._on_kb_layout_changed)
+        sg.addWidget(self.kb_layout_cb, row, 2)
+
+        self.kb_desc_lbl = QLabel(KEYBOARD_LAYOUTS["QWERTY"]["description"])
+        self.kb_desc_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; font-style: italic;")
+        self.kb_desc_lbl.setEnabled(False)
+        sg.addWidget(self.kb_desc_lbl, row, 3)
+
+        row += 1
+        self.preview_layout_btn = QPushButton("🖼  Preview Layout")
+        self.preview_layout_btn.setObjectName("previewBtn")
+        self.preview_layout_btn.clicked.connect(self._preview_layout)
+        sg.addWidget(self.preview_layout_btn, row, 0, 1, 2)
+
+        root.addWidget(settings_group)
+
+        # --- Progress ---
+        prog_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        prog_row.addWidget(self.progress_bar)
+        root.addLayout(prog_row)
+
+        # --- Buttons ---
+        btn_row2 = QHBoxLayout()
+        btn_row2.addStretch()
+
+        self.export_btn = QPushButton("Export Checked")
+        self.export_btn.setObjectName("primaryBtn")
+        self.export_btn.setMinimumHeight(36)
+        self.export_btn.clicked.connect(self._start_export)
+        btn_row2.addWidget(self.export_btn)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_export)
+        btn_row2.addWidget(self.cancel_btn)
+
+        root.addLayout(btn_row2)
+
+        # --- Status bar ---
+        self.statusBar().showMessage("Ready. Place code files in input/ folder and click Scan.")
+
+        # --- Audio preview player ---
+        self._audio_player = QMediaPlayer()
+        self._audio_output = QAudioOutput()
+        self._audio_player.setAudioOutput(self._audio_output)
+        self._audio_output.setVolume(self.vol_sl.value() / 100.0)
+
+    def _on_sound_toggled(self, checked: bool):
+        """Enable/disable sound-related controls."""
+        self.sound_preset_cb.setEnabled(checked)
+        self.preview_btn.setEnabled(checked)
+        self.preset_desc_lbl.setEnabled(checked)
+
+    def _on_preset_changed(self, preset_name: str):
+        """Update the preset description label."""
+        desc = SOUND_PRESETS.get(preset_name, {}).get("description", "")
+        self.preset_desc_lbl.setText(desc)
+
+    def _on_kb_overlay_toggled(self, checked: bool):
+        """Enable/disable keyboard overlay controls."""
+        self.kb_layout_cb.setEnabled(checked)
+        self.kb_desc_lbl.setEnabled(checked)
+
+    def _on_kb_layout_changed(self, layout_name: str):
+        """Update the keyboard layout description label."""
+        desc = KEYBOARD_LAYOUTS.get(layout_name, {}).get("description", "")
+        self.kb_desc_lbl.setText(desc)
+
+    def _preview_sound(self):
+        """Open the professional audio preview dialog."""
+        if not self.sound_chk.isChecked():
+            return
+        preset = self.sound_preset_cb.currentText()
+        vol = self.vol_sl.value() / 100.0
+        dlg = AudioPreviewDialog(self, preset_name=preset, volume=vol)
+        dlg.exec()
+
+    def _preview_layout(self):
+        """Open the layout preview dialog showing a rendered frame."""
+        try:
+            # Determine code to preview: first checked file, or sample code
+            code = None
+            title_text = "preview.py - Code Editor"
+            language = "Python"
+            for it in self._items:
+                if it.checked:
+                    try:
+                        with open(it.path, "r", encoding="utf-8", errors="replace") as f:
+                            code = f.read()
+                        title_text = f"{os.path.basename(it.path)} - Code Editor"
+                        ext = os.path.splitext(it.path)[1].lower()
+                        language = EXT_TO_LANGUAGE.get(ext, "Python")
+                        break
+                    except Exception:
+                        continue
+            if not code or not code.strip():
+                code = _SAMPLE_CODE
+                title_text = "neural_layer.py - Code Editor"
+                language = "Python"
+
+            res_name = self.res_cb.currentText()
+            w, h = RESOLUTIONS.get(res_name, (1920, 1080))
+            theme_name = self.theme_cb.currentText()
+
+            # Keyboard overlay setup
+            kb_overlay = None
+            kb_h = 0
+            if self.kb_overlay_chk.isChecked():
+                layout_name = self.kb_layout_cb.currentText()
+                kb_overlay = KeyboardOverlay(
+                    video_w=w, video_h=h,
+                    layout_name=layout_name,
+                    theme=THEMES.get(theme_name, THEMES["Dracula"]),
+                )
+                kb_h = kb_overlay.height_needed()
+
+            font_size = CodeRenderer.auto_font_size(
+                code_lines=code.count("\n") + 1,
+                width=w, height=h, code=code,
+                font_family="Consolas", keyboard_h=kb_h,
+            )
+
+            renderer = CodeRenderer(
+                width=w, height=h,
+                theme_name=theme_name,
+                font_size=font_size,
+                title_text=title_text,
+                language=language,
+                keyboard_overlay=kb_overlay,
+            )
+            animator = TypingAnimator(
+                code,
+                wpm=self.wpm_sp.value(),
+                start_pause=self.start_pause_sp.value(),
+                end_pause=self.end_pause_sp.value(),
+            )
+            dlg = LayoutPreviewDialog(
+                self, renderer, animator, theme_name, res_name,
+            )
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Preview Error", f"Could not generate preview:\n{e}")
+            log.warning("Layout preview failed: %s", e, exc_info=True)
+
+    # ── Settings persistence ─────────────────────────────────────────
+
+    def _connect_settings_signals(self):
+        """Connect all settings widgets so any change auto-saves."""
+        self.theme_cb.currentTextChanged.connect(self._auto_save_settings)
+        self.res_cb.currentTextChanged.connect(self._auto_save_settings)
+        self.wpm_sp.valueChanged.connect(self._auto_save_settings)
+        self.fps_sp.valueChanged.connect(self._auto_save_settings)
+        self.start_pause_sp.valueChanged.connect(self._auto_save_settings)
+        self.end_pause_sp.valueChanged.connect(self._auto_save_settings)
+        self.sound_chk.toggled.connect(self._auto_save_settings)
+        self.vol_sl.valueChanged.connect(self._auto_save_settings)
+        self.sound_preset_cb.currentTextChanged.connect(self._auto_save_settings)
+        self.kb_overlay_chk.toggled.connect(self._auto_save_settings)
+        self.kb_layout_cb.currentTextChanged.connect(self._auto_save_settings)
+        self.recurse_chk.toggled.connect(self._auto_save_settings)
+        self.depth_sp.valueChanged.connect(self._auto_save_settings)
+
+    def _auto_save_settings(self, *_args):
+        """Slot that saves settings whenever any widget changes (debounced)."""
+        if self._loading_settings:
+            return
+        # Debounce: restart a single-shot timer on every change
+        if not hasattr(self, "_save_timer"):
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.setInterval(300)
+            self._save_timer.timeout.connect(self._save_settings)
+        self._save_timer.start()
+
+    def _save_settings(self):
+        """Persist current widget values to SETTINGS_FILE as JSON."""
+        try:
+            data = {
+                "theme": self.theme_cb.currentText(),
+                "resolution": self.res_cb.currentText(),
+                "wpm": self.wpm_sp.value(),
+                "fps": self.fps_sp.value(),
+                "start_pause": self.start_pause_sp.value(),
+                "end_pause": self.end_pause_sp.value(),
+                "sound_enabled": self.sound_chk.isChecked(),
+                "volume": self.vol_sl.value(),
+                "sound_preset": self.sound_preset_cb.currentText(),
+                "kb_overlay": self.kb_overlay_chk.isChecked(),
+                "kb_layout": self.kb_layout_cb.currentText(),
+                "recursive": self.recurse_chk.isChecked(),
+                "depth": self.depth_sp.value(),
+            }
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            log.debug("Settings saved to %s", SETTINGS_FILE)
+        except Exception as e:
+            log.warning("Failed to save settings: %s", e)
+
+    def _load_settings(self):
+        """Load previously saved settings from SETTINGS_FILE and apply to widgets."""
+        if not os.path.isfile(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("Failed to load settings: %s", e)
+            return
+
+        self._loading_settings = True
+        try:
+            if "theme" in data and data["theme"] in THEMES:
+                self.theme_cb.setCurrentText(data["theme"])
+            if "resolution" in data and data["resolution"] in RESOLUTIONS:
+                self.res_cb.setCurrentText(data["resolution"])
+            if "wpm" in data:
+                self.wpm_sp.setValue(int(data["wpm"]))
+            if "fps" in data:
+                self.fps_sp.setValue(int(data["fps"]))
+            if "start_pause" in data:
+                self.start_pause_sp.setValue(float(data["start_pause"]))
+            if "end_pause" in data:
+                self.end_pause_sp.setValue(float(data["end_pause"]))
+            if "sound_enabled" in data:
+                self.sound_chk.setChecked(bool(data["sound_enabled"]))
+            if "volume" in data:
+                self.vol_sl.setValue(int(data["volume"]))
+            if "sound_preset" in data and data["sound_preset"] in SOUND_PRESETS:
+                self.sound_preset_cb.setCurrentText(data["sound_preset"])
+            if "kb_overlay" in data:
+                self.kb_overlay_chk.setChecked(bool(data["kb_overlay"]))
+            if "kb_layout" in data and data["kb_layout"] in KEYBOARD_LAYOUTS:
+                self.kb_layout_cb.setCurrentText(data["kb_layout"])
+            if "recursive" in data:
+                self.recurse_chk.setChecked(bool(data["recursive"]))
+            if "depth" in data:
+                self.depth_sp.setValue(int(data["depth"]))
+            log.debug("Settings loaded from %s", SETTINGS_FILE)
+        finally:
+            self._loading_settings = False
+
+    def closeEvent(self, event):
+        """Save settings before the window closes."""
+        self._save_settings()
+        super().closeEvent(event)
+
+    # ── File scanning ───────────────────────────────────────────────
+
+    def _scan_input_dir(self):
+        """Scan the default input/ folder, optionally recursing into subfolders."""
+        self._scan_directory(INPUT_DIR)
+
+    def _scan_folder(self):
+        """Let the user pick a custom root folder to scan."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Root Folder to Scan", INPUT_DIR,
+        )
+        if folder:
+            self._scan_directory(folder)
+
+    def _scan_directory(self, root_dir: str):
+        """Recursively scan a directory for code files."""
+        self._items.clear()
+        if not os.path.isdir(root_dir):
+            self.statusBar().showMessage(f"Folder not found: {root_dir}")
+            self._refresh_table()
+            return
+
+        max_depth = self.depth_sp.value() if self.recurse_chk.isChecked() else 1
+        found: List[FileItem] = []
+        skipped_dirs = set()  # skip common non-code dirs
+        _SKIP_DIRS = frozenset({
+            ".git", ".hg", ".svn", "__pycache__", "node_modules",
+            ".venv", "venv", ".env", ".idea", ".vscode", "dist",
+            "build", ".tox", ".mypy_cache", ".pytest_cache", ".next",
+            ".nuxt", "target", "vendor", ".bundle",
+        })
+
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            # Compute depth relative to root
+            rel = os.path.relpath(dirpath, root_dir)
+            if rel == ".":
+                depth = 1
+            else:
+                depth = rel.count(os.sep) + 2
+
+            if depth > max_depth:
+                # Prune deeper subdirectories
+                dirnames.clear()
+                continue
+
+            # Filter out skipped directories in-place (affects os.walk recursion)
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _SKIP_DIRS and not d.startswith(".")
+            ]
+
+            for fname in sorted(filenames):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in SUPPORTED_EXTENSIONS:
+                    fpath = os.path.join(dirpath, fname)
+                    found.append(FileItem(path=fpath))
+
+        self._items = found
+        self._refresh_table()
+
+        recurse_note = f" (depth ≤ {max_depth})" if self.recurse_chk.isChecked() else " (top-level only)"
+        self.file_count_lbl.setText(f"{len(self._items)} file(s) found{recurse_note}")
+        self.statusBar().showMessage(
+            f"Found {len(self._items)} code file(s) in {root_dir}{recurse_note}"
+        )
+
+    def _add_files(self):
+        ext_str = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Code Files", "",
+            f"Code Files ({ext_str});;All Files (*)",
+        )
+        for p in paths:
+            if not any(it.path == p for it in self._items):
+                self._items.append(FileItem(path=p))
+        self._refresh_table()
+
+    def _select_all(self):
+        for it in self._items:
+            it.checked = True
+        self._refresh_table()
+
+    def _deselect_all(self):
+        for it in self._items:
+            it.checked = False
+        self._refresh_table()
+
+    def _on_item_changed(self, item):
+        row = item.row()
+        col = item.column()
+        if col == 0 and 0 <= row < len(self._items):
+            self._items[row].checked = (item.checkState() == Qt.CheckState.Checked)
+
+    def _refresh_table(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self._items))
+        for i, item in enumerate(self._items):
+            # Checkbox
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(
+                Qt.CheckState.Checked if item.checked else Qt.CheckState.Unchecked
+            )
+            self.table.setItem(i, 0, chk)
+
+            # Relative path (show relative to CWD or absolute for external files)
+            try:
+                rel = os.path.relpath(item.path, CWD)
+                display_path = rel if not rel.startswith("..") else item.path
+            except ValueError:
+                display_path = item.path
+            path_item = QTableWidgetItem(display_path)
+            path_item.setToolTip(item.path)  # full path in tooltip
+            self.table.setItem(i, 1, path_item)
+
+            # Language
+            ext = os.path.splitext(item.path)[1].lower()
+            lang = EXT_TO_LANGUAGE.get(ext, "Python")
+            self.table.setItem(i, 2, QTableWidgetItem(lang))
+
+            # Status
+            status_item = QTableWidgetItem(item.status)
+            if item.status == "Done":
+                status_item.setForeground(QColor("#50fa7b"))
+            elif item.status == "Failed":
+                status_item.setForeground(QColor("#ff5555"))
+            elif item.status == "Rendering":
+                status_item.setForeground(QColor("#8be9fd"))
+            self.table.setItem(i, 3, status_item)
+
+        self.table.blockSignals(False)
+
+    # ── Export ──────────────────────────────────────────────────────
+
+    def _start_export(self):
+        checked = [it for it in self._items if it.checked]
+        if not checked:
+            QMessageBox.information(self, "Nothing selected", "Check at least one program to export.")
+            return
+
+        # Reset statuses
+        for it in checked:
+            it.status = "Pending"
+            it.output_path = None
+            it.error = None
+        self._refresh_table()
+
+        self._export_queue = list(checked)
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._export_next()
+
+    def _export_next(self):
+        if not self._export_queue:
+            self.export_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
+            done = sum(1 for it in self._items if it.status == "Done")
+            failed = sum(1 for it in self._items if it.status == "Failed")
+            msg = f"Batch complete: {done} done"
+            if failed:
+                msg += f", {failed} failed"
+            self.statusBar().showMessage(msg)
+            self.progress_bar.setValue(100)
+            return
+
+        item = self._export_queue.pop(0)
+        item.status = "Rendering"
+        self._refresh_table()
+
+        # Read code
+        try:
+            with open(item.path, "r", encoding="utf-8", errors="replace") as f:
+                code = f.read()
+        except Exception as e:
+            item.status = "Failed"
+            item.error = str(e)
+            self._refresh_table()
+            self._export_next()
+            return
+
+        if not code.strip():
+            item.status = "Failed"
+            item.error = "Empty file"
+            self._refresh_table()
+            self._export_next()
+            return
+
+        # Resolve settings
+        ext = os.path.splitext(item.path)[1].lower()
+        language = EXT_TO_LANGUAGE.get(ext, "Python")
+        res_name = self.res_cb.currentText()
+        w, h = RESOLUTIONS.get(res_name, (1920, 1080))
+
+        font_size = CodeRenderer.auto_font_size(
+            code_lines=code.count("\n") + 1,
+            width=w, height=h,
+            code=code,
+            font_family="Consolas",
+        )
+
+        title = f"{os.path.basename(item.path)} - Code Editor"
+
+        # Keyboard overlay
+        kb_overlay = None
+        kb_h = 0
+        if self.kb_overlay_chk.isChecked():
+            layout_name = self.kb_layout_cb.currentText()
+            kb_overlay = KeyboardOverlay(
+                video_w=w, video_h=h,
+                layout_name=layout_name,
+                theme=THEMES.get(self.theme_cb.currentText(), THEMES["Dracula"]),
+            )
+            kb_h = kb_overlay.height_needed()
+            # Recalculate font size with keyboard space reserved
+            font_size = CodeRenderer.auto_font_size(
+                code_lines=code.count("\n") + 1,
+                width=w, height=h,
+                code=code,
+                font_family="Consolas",
+                keyboard_h=kb_h,
+            )
+
+        renderer = CodeRenderer(
+            width=w, height=h,
+            theme_name=self.theme_cb.currentText(),
+            font_size=font_size,
+            title_text=title,
+            language=language,
+            keyboard_overlay=kb_overlay,
+        )
+
+        animator = TypingAnimator(
+            code,
+            wpm=self.wpm_sp.value(),
+            start_pause=self.start_pause_sp.value(),
+            end_pause=self.end_pause_sp.value(),
+        )
+
+        # Output path
+        base = os.path.splitext(os.path.basename(item.path))[0]
+        output = os.path.join(OUTPUT_DIR, f"{base}.mp4")
+
+        sound_gen = SimpleSoundGen(preset=self.sound_preset_cb.currentText()) if self.sound_chk.isChecked() else None
+
+        self._exporter = VideoExporter(
+            code=code,
+            output=output,
+            renderer=renderer,
+            animator=animator,
+            fps=self.fps_sp.value(),
+            sound_gen=sound_gen,
+            volume=self.vol_sl.value() / 100.0,
+        )
+        self._exporter.progress.connect(self.progress_bar.setValue)
+        self._exporter.status.connect(self.statusBar().showMessage)
+        self._exporter.finished_ok.connect(lambda p: self._on_item_done(item, p))
+        self._exporter.error.connect(lambda e: self._on_item_failed(item, e))
+        self._exporter.start()
+
+    def _on_item_done(self, item: FileItem, path: str):
+        item.status = "Done"
+        item.output_path = path
+        self._refresh_table()
+        self._exporter = None
+        self._export_next()
+
+    def _on_item_failed(self, item: FileItem, err: str):
+        item.status = "Failed"
+        item.error = err
+        self._refresh_table()
+        self._exporter = None
+        self._export_next()
+
+    def _cancel_export(self):
+        if self._exporter:
+            self._exporter.cancel()
+        self._export_queue.clear()
+
+
+# =====================================================================
+# Entry point
+# =====================================================================
+
+STYLE = """
+QMainWindow, QDialog { background: #1e1e2e; }
+QGroupBox {
+    color: #cdd6f4; font-weight: bold; font-size: 13px;
+    border: 1px solid #45475a; border-radius: 8px;
+    margin-top: 12px; padding-top: 16px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 12px; }
+QLabel { color: #cdd6f4; }
+QTableWidget {
+    background: #181825; color: #cdd6f4; gridline-color: #313244;
+    border: 1px solid #45475a; border-radius: 6px;
+    selection-background-color: #45475a;
+}
+QHeaderView::section {
+    background: #313244; color: #cdd6f4; padding: 6px;
+    border: none; font-weight: bold;
+}
+QComboBox, QSpinBox, QDoubleSpinBox {
+    background: #313244; color: #cdd6f4; border: 1px solid #45475a;
+    border-radius: 4px; padding: 4px 8px; min-height: 24px;
+}
+QComboBox::drop-down { border: none; }
+QComboBox QAbstractItemView {
+    background: #313244; color: #cdd6f4;
+    selection-background-color: #45475a;
+}
+QCheckBox { color: #cdd6f4; spacing: 6px; }
+QCheckBox::indicator {
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 2px solid #45475a; background: #313244;
+}
+QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
+QPushButton {
+    background: #313244; color: #cdd6f4; border: 1px solid #45475a;
+    border-radius: 6px; padding: 6px 16px; font-size: 13px;
+}
+QPushButton:hover { background: #45475a; }
+QPushButton:disabled { color: #585b70; }
+QPushButton#primaryBtn {
+    background: #89b4fa; color: #1e1e2e; font-weight: bold;
+    border: none; padding: 8px 24px; font-size: 14px;
+}
+QPushButton#primaryBtn:hover { background: #74c7ec; }
+QPushButton#primaryBtn:disabled { background: #45475a; color: #585b70; }
+QPushButton#previewBtn {
+    background: #a6e3a1; color: #1e1e2e; font-weight: bold;
+    border: none; padding: 6px 14px; font-size: 12px;
+}
+QPushButton#previewBtn:hover { background: #94e2d5; }
+QPushButton#previewBtn:disabled { background: #45475a; color: #585b70; }
+QProgressBar {
+    background: #313244; border: none; border-radius: 4px;
+    text-align: center; color: #cdd6f4; min-height: 20px;
+}
+QProgressBar::chunk { background: #89b4fa; border-radius: 4px; }
+QStatusBar { color: #a6adc8; font-size: 12px; }
+"""
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLE)
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor("#1e1e2e"))
+    pal.setColor(QPalette.WindowText, QColor("#cdd6f4"))
+    pal.setColor(QPalette.Base, QColor("#313244"))
+    pal.setColor(QPalette.Text, QColor("#cdd6f4"))
+    pal.setColor(QPalette.Button, QColor("#313244"))
+    pal.setColor(QPalette.ButtonText, QColor("#cdd6f4"))
+    pal.setColor(QPalette.Highlight, QColor("#89b4fa"))
+    pal.setColor(QPalette.HighlightedText, QColor("#1e1e2e"))
+    app.setPalette(pal)
+
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
