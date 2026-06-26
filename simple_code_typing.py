@@ -1291,6 +1291,7 @@ class CodeRenderer:
         font_size: int = 22,
         show_line_numbers: bool = True,
         show_window_chrome: bool = True,
+        gutter_gap: int = 8,
         padding: int = 24,
         tab_size: int = 4,
         title_text: str = "main.py",
@@ -1308,6 +1309,7 @@ class CodeRenderer:
         self.font_size = font_size
         self.show_line_numbers = show_line_numbers
         self.show_window_chrome = show_window_chrome
+        self.gutter_gap = gutter_gap
         self.padding = padding
         self.tab_size = tab_size
         self.title_text = title_text
@@ -1517,7 +1519,8 @@ class CodeRenderer:
     def auto_font_size(
         code_lines: int, width: int, height: int,
         padding: int = 24, show_window_chrome: bool = True,
-        show_line_numbers: bool = True, tab_size: int = 4,
+        show_line_numbers: bool = True, gutter_gap: int = 8,
+        tab_size: int = 4,
         code: Optional[str] = None, font_family: str = "Consolas",
         keyboard_h: int = 0,
     ) -> int:
@@ -1559,7 +1562,7 @@ class CodeRenderer:
 
         # ── helper: line-number width at a given font size ──
         def _ln_width(cw: int) -> int:
-            return (len(str(code_lines)) * cw + 16) if show_line_numbers else 0
+            return (len(str(code_lines)) * cw + gutter_gap) if show_line_numbers else 0
 
         # ── binary search: largest size where code_lines fit in rect_h ──
         #    condition: code_lines * fm.height() <= rect_h
@@ -1838,10 +1841,13 @@ class CodeRenderer:
         if scroll > max_scroll:
             scroll = max_scroll
 
-        # Line number width
+        # Line number width (digits only, used for drawing the number text)
+        ln_text_width = 0
+        # Full gutter width (digits + gap, used for x0 and separator)
         ln_width = 0
         if self.show_line_numbers:
-            ln_width = len(str(total_lines + scroll)) * self.char_w + 16
+            ln_text_width = len(str(total_lines + scroll)) * self.char_w
+            ln_width = ln_text_width + self.gutter_gap
 
         # Map cursor to screen coordinates
         current_scroll_line = cursor_line - scroll
@@ -1896,7 +1902,7 @@ class CodeRenderer:
                     self._qc_ln_active if li == cursor_line else self._qc_ln
                 )
                 p.drawText(
-                    QRect(cr.left(), y, ln_width, lh),
+                    QRect(cr.left(), y, ln_text_width, lh),
                     Qt.AlignRight | Qt.AlignVCenter,
                     str(li + 1),
                 )
@@ -3279,6 +3285,16 @@ class MainWindow(QMainWindow):
         self.line_numbers_chk.setToolTip("Toggle line-number gutter on/off to gain horizontal space")
         ll.addRow(self.line_numbers_chk)
 
+        self.gutter_gap_sp = QSpinBox()
+        self.gutter_gap_sp.setRange(4, 80)
+        self.gutter_gap_sp.setValue(8)
+        self.gutter_gap_sp.setSuffix(" px")
+        self.gutter_gap_sp.setToolTip(
+            "Horizontal gap between the line numbers and the code text.\n"
+            "Higher values add more breathing room in the gutter."
+        )
+        ll.addRow("Gutter Gap:", self.gutter_gap_sp)
+
         sl.addWidget(layout_grp)
 
         # -- Typing Group --
@@ -3630,6 +3646,7 @@ class MainWindow(QMainWindow):
                     padding=self.padding_sp.value(),
                     show_window_chrome=self.chrome_chk.isChecked(),
                     show_line_numbers=self.line_numbers_chk.isChecked(),
+                    gutter_gap=self.gutter_gap_sp.value(),
                 )
             else:
                 font_size = self.font_size_sp.value()
@@ -3638,7 +3655,8 @@ class MainWindow(QMainWindow):
                          kb_checked, self._kb_position_key(),
                          wpm, start_pause, end_pause, title_text,
                          self.padding_sp.value(), self.chrome_chk.isChecked(),
-                         self.line_numbers_chk.isChecked())
+                         self.line_numbers_chk.isChecked(),
+                         self.gutter_gap_sp.value())
 
             # Rebuild cached objects only when the key changes
             if cache_key != self._cached_preview_key:
@@ -3664,6 +3682,7 @@ class MainWindow(QMainWindow):
                         padding=self.padding_sp.value(),
                         show_window_chrome=self.chrome_chk.isChecked(),
                         show_line_numbers=self.line_numbers_chk.isChecked(),
+                        gutter_gap=self.gutter_gap_sp.value(),
                     )
 
                 self._cached_preview_code = code
@@ -3678,6 +3697,7 @@ class MainWindow(QMainWindow):
                     padding=self.padding_sp.value(),
                     show_window_chrome=self.chrome_chk.isChecked(),
                     show_line_numbers=self.line_numbers_chk.isChecked(),
+                    gutter_gap=self.gutter_gap_sp.value(),
                     total_code_lines=code.count("\n") + 1,
                 )
                 self._cached_preview_animator = TypingAnimator(
@@ -3928,6 +3948,8 @@ class MainWindow(QMainWindow):
         self.line_numbers_chk.toggled.connect(self._auto_save_settings)
         self.line_numbers_chk.toggled.connect(self._invalidate_preview_cache)
         self.line_numbers_chk.toggled.connect(self._schedule_preview_update)
+        self.gutter_gap_sp.valueChanged.connect(self._auto_save_settings)
+        self.gutter_gap_sp.valueChanged.connect(self._invalidate_preview_cache)
         self._guide_padding_chk.toggled.connect(self._schedule_preview_update)
         self._guide_chrome_chk.toggled.connect(self._schedule_preview_update)
         self._guide_code_chk.toggled.connect(self._schedule_preview_update)
@@ -3972,6 +3994,7 @@ class MainWindow(QMainWindow):
                 "padding": self.padding_sp.value(),
                 "show_chrome": self.chrome_chk.isChecked(),
                 "show_line_numbers": self.line_numbers_chk.isChecked(),
+                "gutter_gap": self.gutter_gap_sp.value(),
             }
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -4038,6 +4061,8 @@ class MainWindow(QMainWindow):
                 self.chrome_chk.setChecked(bool(data["show_chrome"]))
             if "show_line_numbers" in data:
                 self.line_numbers_chk.setChecked(bool(data["show_line_numbers"]))
+            if "gutter_gap" in data:
+                self.gutter_gap_sp.setValue(int(data["gutter_gap"]))
             log.debug("Settings loaded from %s", SETTINGS_FILE)
         finally:
             self._loading_settings = False
@@ -4251,6 +4276,7 @@ class MainWindow(QMainWindow):
                 font_family=_chosen_font,
                 padding=_pad, show_window_chrome=_chrome,
                 show_line_numbers=_ln,
+                gutter_gap=self.gutter_gap_sp.value(),
             )
         else:
             font_size = self.font_size_sp.value()
@@ -4284,6 +4310,7 @@ class MainWindow(QMainWindow):
                     keyboard_h=kb_h,
                     padding=_pad, show_window_chrome=_chrome,
                     show_line_numbers=_ln,
+                    gutter_gap=self.gutter_gap_sp.value(),
                 )
 
         renderer = CodeRenderer(
@@ -4297,6 +4324,7 @@ class MainWindow(QMainWindow):
             padding=_pad,
             show_window_chrome=_chrome,
             show_line_numbers=_ln,
+            gutter_gap=self.gutter_gap_sp.value(),
             total_code_lines=code.count("\n") + 1,
         )
 
